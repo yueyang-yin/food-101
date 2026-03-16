@@ -1,0 +1,70 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Packaging / build
+build/
+dist/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# Testing / lint / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Experiment tracking / training logs
+mlruns/
+wandb/
+lightning_logs/
+runs/
+logs/
+outputs/
+
+# Deep learning artifacts
+artifacts/
+checkpoints/
+models/
+weights/
+
+# Model exports / large binaries
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.pb
+*.tflite
+*.mlmodel
+*.h5
+*.joblib
+*.pkl
+*.npy
+*.npz
+
+# Dataset directories
+data/
+dataset/
+datasets/
+
+# IDE / editor
+.idea/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
