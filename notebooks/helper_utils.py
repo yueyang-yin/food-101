@@ -385,7 +385,7 @@ def _build_epoch_history(df, one_based_epoch=True):
 def plot_training_curves(
     df=None,
     metrics_csv=None,
-    title="Food-101 Baseline Training Curves",
+    title="Food-101 Training Curves",
     figsize=(14, 5),
     one_based_epoch=True,
     mark_best=True,
