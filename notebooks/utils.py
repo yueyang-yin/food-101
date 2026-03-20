@@ -3,20 +3,251 @@
 from __future__ import annotations
 
 import inspect
+from collections import defaultdict
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
+import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.optim import Optimizer
+from torch.utils.data import DataLoader, Subset
 from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torchmetrics.classification import Accuracy
-from torchvision import models as tv_models
+from torchvision import datasets, models as tv_models, transforms
 
 try:
     import lightning.pytorch as pl
 except ModuleNotFoundError:
     import pytorch_lightning as pl
+
+
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD = [0.229, 0.224, 0.225]
+
+
+@dataclass(frozen=True)
+class TransformBundle:
+    # Keep train/val/test transforms grouped together so notebook cells can swap
+    # between presets without threading three separate variables around.
+    train: Any
+    val: Any
+    test: Any
+
+
+# Build the default ImageNet-style augmentation/evaluation transforms used by
+# the notebook's transfer-learning experiments.
+def create_food101_transforms(
+    train_crop_size: int = 224,
+    eval_resize_size: int = 256,
+    eval_crop_size: int | None = None,
+    mean: list[float] | tuple[float, ...] = IMAGENET_MEAN,
+    std: list[float] | tuple[float, ...] = IMAGENET_STD,
+) -> TransformBundle:
+    eval_crop_size = eval_crop_size or train_crop_size
+
+    train_transform = transforms.Compose(
+        [
+            transforms.RandomResizedCrop(train_crop_size),
+            transforms.RandomHorizontalFlip(),
+            transforms.ColorJitter(
+                brightness=0.2,
+                contrast=0.2,
+                saturation=0.2,
+            ),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+    )
+
+    eval_transform = transforms.Compose(
+        [
+            transforms.Resize(eval_resize_size),
+            transforms.CenterCrop(eval_crop_size),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=mean, std=std),
+        ]
+    )
+
+    return TransformBundle(
+        train=train_transform,
+        val=eval_transform,
+        test=eval_transform,
+    )
+
+
+def create_datasets(
+    data_dir: str,
+    train_transform: Any,
+    val_transform: Any,
+    test_transform: Any,
+    seed: int = 42,
+):
+    # Food-101 ships only train/test splits, so we create our own validation
+    # subset from the training split while keeping the official test split intact.
+    train_source = datasets.Food101(
+        root=data_dir,
+        split="train",
+        transform=train_transform,
+        download=False,
+    )
+
+    val_source = datasets.Food101(
+        root=data_dir,
+        split="train",
+        transform=val_transform,
+        download=False,
+    )
+
+    test_dataset = datasets.Food101(
+        root=data_dir,
+        split="test",
+        transform=test_transform,
+        download=False,
+    )
+
+    if hasattr(train_source, "_labels"):
+        labels = train_source._labels
+    elif hasattr(train_source, "targets"):
+        labels = train_source.targets
+    else:
+        labels = [train_source[i][1] for i in range(len(train_source))]
+
+    # Group indices by class first so the sampled validation split stays roughly
+    # class-balanced instead of depending on the dataset's original ordering.
+    label_to_indices = defaultdict(list)
+    for idx, label in enumerate(labels):
+        label_to_indices[label].append(idx)
+
+    generator = torch.Generator().manual_seed(seed)
+    train_indices: list[int] = []
+    val_indices: list[int] = []
+
+    for indices in label_to_indices.values():
+        indices_tensor = torch.tensor(indices)
+        permutation = torch.randperm(len(indices_tensor), generator=generator)
+        shuffled_indices = indices_tensor[permutation].tolist()
+
+        # Reserve 20% per class for validation, but keep at least one sample so
+        # very small classes still appear in both splits.
+        split_point = max(1, int(len(shuffled_indices) * 0.2))
+        val_indices.extend(shuffled_indices[:split_point])
+        train_indices.extend(shuffled_indices[split_point:])
+
+    train_dataset = Subset(train_source, train_indices)
+    val_dataset = Subset(val_source, val_indices)
+    return train_dataset, val_dataset, test_dataset
+
+
+# Select the requested split and build a DataLoader with split-appropriate
+# shuffling behavior.
+def load_dataloader(
+    train_dataset,
+    val_dataset,
+    test_dataset,
+    batch_size: int,
+    split: str,
+    num_workers: int,
+):
+    if split == "train":
+        dataset = train_dataset
+        shuffle = True
+    elif split == "val":
+        dataset = val_dataset
+        shuffle = False
+    elif split == "test":
+        dataset = test_dataset
+        shuffle = False
+    else:
+        raise ValueError(f"Unsupported split: {split}")
+
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+    )
+
+
+class Food101DataModule(pl.LightningDataModule):
+    # LightningDataModule wrapper that centralizes transforms, split creation,
+    # and loader configuration for the Food-101 notebook.
+    def __init__(
+        self,
+        data_dir: str,
+        batch_size: int = 64,
+        num_workers: int = 8,
+        seed: int = 42,
+        transforms_bundle: TransformBundle | None = None,
+        train_transform: Any | None = None,
+        val_transform: Any | None = None,
+        test_transform: Any | None = None,
+    ) -> None:
+        super().__init__()
+
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+        self.seed = seed
+
+        default_transforms = transforms_bundle or create_food101_transforms()
+        self.train_transform = train_transform or default_transforms.train
+        self.val_transform = val_transform or default_transforms.val
+        self.test_transform = test_transform or default_transforms.test
+
+        self.train_dataset = None
+        self.val_dataset = None
+        self.test_dataset = None
+
+    def setup(self, stage: str | None = None) -> None:
+        # Build datasets lazily so repeated `setup()` calls from Lightning do not
+        # recreate the same split objects.
+        if (
+            self.train_dataset is None
+            and self.val_dataset is None
+            and self.test_dataset is None
+        ):
+            self.train_dataset, self.val_dataset, self.test_dataset = create_datasets(
+                data_dir=self.data_dir,
+                train_transform=self.train_transform,
+                val_transform=self.val_transform,
+                test_transform=self.test_transform,
+                seed=self.seed,
+            )
+
+    def train_dataloader(self):
+        # Training keeps shuffling enabled inside `load_dataloader`.
+        return load_dataloader(
+            self.train_dataset,
+            self.val_dataset,
+            self.test_dataset,
+            batch_size=self.batch_size,
+            split="train",
+            num_workers=self.num_workers,
+        )
+
+    def val_dataloader(self):
+        # Validation is deterministic so metrics are comparable across epochs.
+        return load_dataloader(
+            self.train_dataset,
+            self.val_dataset,
+            self.test_dataset,
+            batch_size=self.batch_size,
+            split="val",
+            num_workers=self.num_workers,
+        )
+
+    def test_dataloader(self):
+        # Test follows the same deterministic loader settings as validation.
+        return load_dataloader(
+            self.train_dataset,
+            self.val_dataset,
+            self.test_dataset,
+            batch_size=self.batch_size,
+            split="test",
+            num_workers=self.num_workers,
+        )
 
 # Load a pretrained MobileNetV3-Large and swap the classifier head.
 def load_mobilenetV3_large(num_classes: int) -> nn.Module:
@@ -258,12 +489,18 @@ class FlexibleFood101Classifier(pl.LightningModule):
 
 # Keep the notebook-facing constructor name stable.
 def Create_flexible_Food101Classifier(**kwargs: Any) -> FlexibleFood101Classifier:
+    # Preserve the original mixed-case helper name used throughout older notebook cells.
     return FlexibleFood101Classifier(**kwargs)
 
 
 __all__ = [
+    "Food101DataModule",
+    "TransformBundle",
     "Create_flexible_Food101Classifier",
     "FlexibleFood101Classifier",
+    "create_datasets",
+    "create_food101_transforms",
     "define_optimizer_and_scheduler",
+    "load_dataloader",
     "load_mobilenetV3_large",
 ]

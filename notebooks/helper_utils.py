@@ -4,10 +4,20 @@ from collections import Counter
 import math
 from pathlib import Path
 import random
+import socket
+import subprocess
+import sys
+import time
 
 import matplotlib.pyplot as plt
 import pandas as pd
 import torch
+
+try:
+    from IPython.display import HTML, display
+except Exception:
+    HTML = None
+    display = None
 
 # Accepted image extensions when scanning folder-based datasets.
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
@@ -248,6 +258,24 @@ def _resolve_figure_for_saving(fig=None):
     )
 
 # Sample validation images, run inference, and show predicted vs true labels.
+def _require_inference_model(model):
+    if hasattr(model, "eval") and hasattr(model, "parameters"):
+        return model
+
+    if hasattr(model, "lightning_module") or model.__class__.__name__ == "Trainer":
+        raise TypeError(
+            "`show_random_validation_predictions` expects a trained model, not a Trainer. "
+            "Pass the loaded `best_model` checkpoint or `trainer.lightning_module`."
+        )
+
+    raise TypeError(
+        "`show_random_validation_predictions` expects a PyTorch/Lightning model with "
+        "`eval()` and `parameters()` methods."
+    )
+
+
+# Draw a small validation gallery with model predictions so notebook readers can
+# qualitatively inspect what the checkpoint gets right and wrong.
 def show_random_validation_predictions(
     model,
     data_module,
@@ -278,7 +306,8 @@ def show_random_validation_predictions(
     rng = random.Random(random_seed)
     selected_indices = rng.sample(range(dataset_size), num_images)
 
-    was_training = model.training  # restore the original mode afterwards
+    model = _require_inference_model(model)
+    was_training = getattr(model, "training", False)  # restore the original mode afterwards
     model.eval()
 
     try:
@@ -381,103 +410,151 @@ def _build_epoch_history(df, one_based_epoch=True):
     history[epoch_col] = history["epoch"] + 1 if one_based_epoch else history["epoch"]
     return history, epoch_col
 
-# Plot training loss, validation loss, and validation accuracy from Lightning logs.
-def plot_training_curves(
-    df=None,
-    metrics_csv=None,
-    title="Food-101 Training Curves",
-    figsize=(14, 5),
-    one_based_epoch=True,
-    mark_best=True,
+
+# Locate the project's MLflow store without requiring every notebook cell to
+# pass an explicit tracking URI.
+def _default_mlflow_tracking_uri():
+    project_root = Path(__file__).resolve().parent.parent
+    for candidate in (project_root / "mlruns", project_root / "artifacts" / "mlruns"):
+        if candidate.exists():
+            return candidate.as_uri()
+    return (project_root / "mlruns").as_uri()
+
+
+# Reconstruct one metrics dataframe from MLflow metric-history APIs so plotting
+# helpers can work the same way with either CSV logs or MLflow-backed runs.
+def _load_mlflow_metrics_df(
+    *,
+    experiment_name,
+    run_name,
+    tracking_uri=None,
+    metric_names=("epoch", "train_loss", "val_loss", "val_acc"),
 ):
-    if df is None:
-        if metrics_csv is None:
-            raise ValueError("Provide either `df` or `metrics_csv`.")
-        df = pd.read_csv(metrics_csv)
-    else:
-        df = df.copy()
+    try:
+        import mlflow
+    except ImportError as exc:
+        raise ImportError(
+            "Reading training metrics from MLflow requires the `mlflow` package to be installed."
+        ) from exc
 
-    history, epoch_col = _build_epoch_history(df, one_based_epoch=one_based_epoch)
+    tracking_uri = tracking_uri or _default_mlflow_tracking_uri()
+    mlflow.set_tracking_uri(tracking_uri)
 
-    # Use best validation accuracy as the notebook's main model-selection signal.
-    best_point = history.loc[history["val_acc"].idxmax()]
-    best_label = f"Best Val Acc Checkpoint (ckpt epoch={int(best_point['epoch']):02d})"
-    epoch_label = "Epoch (1-based)" if one_based_epoch else "Epoch (0-based)"
+    experiment = mlflow.get_experiment_by_name(experiment_name)
+    if experiment is None:
+        raise ValueError(f"MLflow experiment not found: {experiment_name!r}")
 
-    fig, axes = plt.subplots(1, 2, figsize=figsize)
-
-    # Left panel: train/val loss share the same scale and are easy to compare together.
-    axes[0].plot(
-        history[epoch_col],
-        history["train_loss"],
-        marker="o",
-        linewidth=2,
-        label="Train Loss",
+    runs_df = mlflow.search_runs(
+        experiment_ids=[experiment.experiment_id],
+        filter_string=f"tags.mlflow.runName = '{run_name}'",
+        order_by=["attribute.start_time DESC"],
+        max_results=1,
     )
-    axes[0].plot(
-        history[epoch_col],
-        history["val_loss"],
-        marker="s",
-        linewidth=2,
-        label="Val Loss",
-    )
-    if mark_best:
-        axes[0].scatter(
-            best_point[epoch_col],
-            best_point["val_loss"],
-            marker="*",
-            s=160,
-            zorder=5,
-            label=best_label,
+    if runs_df.empty:
+        raise ValueError(
+            f"MLflow run not found for experiment={experiment_name!r}, run_name={run_name!r}."
         )
-    axes[0].set_title("Training and Validation Loss", fontsize=13)
-    axes[0].set_xlabel(epoch_label)
-    axes[0].set_ylabel("Loss")
-    axes[0].set_xticks(history[epoch_col])
-    axes[0].grid(True, linestyle="--", alpha=0.4)
-    axes[0].legend()
 
-    # Right panel: validation accuracy gets its own axis so small gains stay visible.
-    axes[1].plot(
-        history[epoch_col],
-        history["val_acc"],
-        marker="o",
-        linewidth=2,
-        label="Val Accuracy",
-    )
-    if mark_best:
-        axes[1].scatter(
-            best_point[epoch_col],
-            best_point["val_acc"],
-            marker="*",
-            s=160,
-            zorder=5,
-            label=best_label,
+    run_id = runs_df.iloc[0]["run_id"]
+    client = mlflow.tracking.MlflowClient()
+
+    # MLflow stores each metric stream separately, so merge them back on `step`.
+    metric_frames = []
+    for metric_name in metric_names:
+        history = client.get_metric_history(run_id, metric_name)
+        if not history:
+            continue
+
+        metric_df = pd.DataFrame(
+            {
+                "step": [metric.step for metric in history],
+                metric_name: [metric.value for metric in history],
+            }
         )
-    axes[1].set_title("Validation Accuracy", fontsize=13)
-    axes[1].set_xlabel(epoch_label)
-    axes[1].set_ylabel("Accuracy")
-    axes[1].set_xticks(history[epoch_col])
-    axes[1].grid(True, linestyle="--", alpha=0.4)
-    axes[1].legend()
+        metric_df = metric_df.drop_duplicates(subset="step", keep="last")
+        metric_frames.append(metric_df)
 
-    plt.suptitle(title, fontsize=15)
-    plt.tight_layout()
-    _remember_figure(fig)
-    plt.show()
-    return fig, axes
+    if not metric_frames:
+        raise ValueError(
+            f"No metric history was found for MLflow run={run_name!r} in experiment={experiment_name!r}."
+        )
 
-# Compare Stage 1 and Stage 2 logs and return both plots and summary tables.
+    merged_df = metric_frames[0]
+    for metric_df in metric_frames[1:]:
+        merged_df = merged_df.merge(metric_df, on="step", how="outer")
+
+    merged_df = merged_df.sort_values("step").reset_index(drop=True)
+    if "epoch" not in merged_df.columns:
+        raise ValueError("MLflow metric history does not contain the required `epoch` metric.")
+
+    merged_df["epoch"] = merged_df["epoch"].ffill()
+    merged_df = merged_df[merged_df["epoch"].notna()].copy()
+    merged_df["epoch"] = merged_df["epoch"].astype(int)
+    return merged_df
+
+
+# Accept either a preloaded dataframe or an MLflow experiment/run pair and
+# normalize both paths into one metrics dataframe.
+def _resolve_training_metrics_df(
+    df=None,
+    *,
+    experiment_name=None,
+    run_name=None,
+    tracking_uri=None,
+):
+    if df is not None:
+        return df.copy()
+
+    if experiment_name is not None and run_name is not None:
+        return _load_mlflow_metrics_df(
+            experiment_name=experiment_name,
+            run_name=run_name,
+            tracking_uri=tracking_uri,
+        )
+
+    raise ValueError(
+        "Provide either a metrics dataframe or both `experiment_name` and `run_name` for MLflow."
+    )
+
+# Compare Stage 1 and Stage 2 metrics and return a compact summary table.
 def compare_stage_training_runs(
-    stage1_df,
-    stage2_df,
+    stage1_df=None,
+    stage2_df=None,
     stage1_name="Stage 1",
     stage2_name="Stage 2",
     one_based_epoch=True,
     print_summary=False,
+    plot=False,
+    return_details=False,
+    stage1_experiment_name=None,
+    stage2_experiment_name=None,
+    stage1_run_name=None,
+    stage2_run_name=None,
+    tracking_uri=None,
 ):
-    stage1_history, epoch_col = _build_epoch_history(stage1_df.copy(), one_based_epoch=one_based_epoch)
-    stage2_history, _ = _build_epoch_history(stage2_df.copy(), one_based_epoch=one_based_epoch)
+    # Allow both direct CSV/dataframe comparisons and MLflow-backed comparisons
+    # so the same helper works during experimentation and report writing.
+    stage1_metrics_df = _resolve_training_metrics_df(
+        stage1_df,
+        experiment_name=stage1_experiment_name,
+        run_name=stage1_run_name,
+        tracking_uri=tracking_uri,
+    )
+    stage2_metrics_df = _resolve_training_metrics_df(
+        stage2_df,
+        experiment_name=stage2_experiment_name,
+        run_name=stage2_run_name,
+        tracking_uri=tracking_uri,
+    )
+
+    stage1_history, epoch_col = _build_epoch_history(
+        stage1_metrics_df,
+        one_based_epoch=one_based_epoch,
+    )
+    stage2_history, _ = _build_epoch_history(
+        stage2_metrics_df,
+        one_based_epoch=one_based_epoch,
+    )
     epoch_label = "Epoch (1-based)" if one_based_epoch else "Epoch (0-based)"
 
     # Track both the best validation checkpoint and the final epoch for each stage.
@@ -525,425 +602,277 @@ def compare_stage_training_runs(
         ]
     )
 
-    max_epoch = int(max(stage1_history[epoch_col].max(), stage2_history[epoch_col].max()))
-    xticks = list(range(1, max_epoch + 1))
+    fig = None
+    axes = None
+    if plot:
+        max_epoch = int(max(stage1_history[epoch_col].max(), stage2_history[epoch_col].max()))
+        xticks = list(range(1, max_epoch + 1))
 
-    fig, axes = plt.subplots(2, 2, figsize=(16, 10))
-    axes = axes.flatten()
+        fig, axes = plt.subplots(2, 2, figsize=(16, 10))
+        axes = axes.flatten()
 
-    # Panel 1: train loss progression.
-    axes[0].plot(
-        stage1_history[epoch_col],
-        stage1_history["train_loss"],
-        marker="o",
-        linewidth=2,
-        label=f"{stage1_name} Train Loss ({int(stage1_final[epoch_col])} epochs)",
-    )
-    axes[0].plot(
-        stage2_history[epoch_col],
-        stage2_history["train_loss"],
-        marker="s",
-        linewidth=2,
-        label=f"{stage2_name} Train Loss ({int(stage2_final[epoch_col])} epochs)",
-    )
-    axes[0].scatter(
-        stage1_final[epoch_col],
-        stage1_final["train_loss"],
-        marker="D",
-        s=90,
-        zorder=5,
-        label=f"{stage1_name} End",
-    )
-    axes[0].scatter(
-        stage2_final[epoch_col],
-        stage2_final["train_loss"],
-        marker="D",
-        s=90,
-        zorder=5,
-        label=f"{stage2_name} End",
-    )
-    axes[0].set_title("Train Loss")
-    axes[0].set_xlabel(epoch_label)
-    axes[0].set_ylabel("Loss")
-    axes[0].set_xticks(xticks)
-    axes[0].grid(True, linestyle="--", alpha=0.4)
-    axes[0].legend()
+        # Panel 1: train loss progression.
+        axes[0].plot(
+            stage1_history[epoch_col],
+            stage1_history["train_loss"],
+            marker="o",
+            linewidth=2,
+            label=f"{stage1_name} Train Loss ({int(stage1_final[epoch_col])} epochs)",
+        )
+        axes[0].plot(
+            stage2_history[epoch_col],
+            stage2_history["train_loss"],
+            marker="s",
+            linewidth=2,
+            label=f"{stage2_name} Train Loss ({int(stage2_final[epoch_col])} epochs)",
+        )
+        axes[0].scatter(
+            stage1_final[epoch_col],
+            stage1_final["train_loss"],
+            marker="D",
+            s=90,
+            zorder=5,
+            label=f"{stage1_name} End",
+        )
+        axes[0].scatter(
+            stage2_final[epoch_col],
+            stage2_final["train_loss"],
+            marker="D",
+            s=90,
+            zorder=5,
+            label=f"{stage2_name} End",
+        )
+        axes[0].set_title("Train Loss")
+        axes[0].set_xlabel(epoch_label)
+        axes[0].set_ylabel("Loss")
+        axes[0].set_xticks(xticks)
+        axes[0].grid(True, linestyle="--", alpha=0.4)
+        axes[0].legend()
 
-    # Panel 2: validation loss with best-epoch and final-epoch markers.
-    axes[1].plot(
-        stage1_history[epoch_col],
-        stage1_history["val_loss"],
-        marker="o",
-        linewidth=2,
-        label=f"{stage1_name} Val Loss",
-    )
-    axes[1].plot(
-        stage2_history[epoch_col],
-        stage2_history["val_loss"],
-        marker="s",
-        linewidth=2,
-        label=f"{stage2_name} Val Loss",
-    )
-    axes[1].scatter(
-        stage1_best[epoch_col],
-        stage1_best["val_loss"],
-        marker="*",
-        s=160,
-        zorder=5,
-        label=f"{stage1_name} Best Val Acc",
-    )
-    axes[1].scatter(
-        stage2_best[epoch_col],
-        stage2_best["val_loss"],
-        marker="*",
-        s=160,
-        zorder=5,
-        label=f"{stage2_name} Best Val Acc",
-    )
-    axes[1].scatter(
-        stage1_final[epoch_col],
-        stage1_final["val_loss"],
-        marker="D",
-        s=90,
-        zorder=5,
-        label=f"{stage1_name} End",
-    )
-    axes[1].scatter(
-        stage2_final[epoch_col],
-        stage2_final["val_loss"],
-        marker="D",
-        s=90,
-        zorder=5,
-        label=f"{stage2_name} End",
-    )
-    axes[1].set_title("Val Loss")
-    axes[1].set_xlabel(epoch_label)
-    axes[1].set_ylabel("Loss")
-    axes[1].set_xticks(xticks)
-    axes[1].grid(True, linestyle="--", alpha=0.4)
-    axes[1].legend()
+        # Panel 2: validation loss with best-epoch and final-epoch markers.
+        axes[1].plot(
+            stage1_history[epoch_col],
+            stage1_history["val_loss"],
+            marker="o",
+            linewidth=2,
+            label=f"{stage1_name} Val Loss",
+        )
+        axes[1].plot(
+            stage2_history[epoch_col],
+            stage2_history["val_loss"],
+            marker="s",
+            linewidth=2,
+            label=f"{stage2_name} Val Loss",
+        )
+        axes[1].scatter(
+            stage1_best[epoch_col],
+            stage1_best["val_loss"],
+            marker="*",
+            s=160,
+            zorder=5,
+            label=f"{stage1_name} Best Val Acc",
+        )
+        axes[1].scatter(
+            stage2_best[epoch_col],
+            stage2_best["val_loss"],
+            marker="*",
+            s=160,
+            zorder=5,
+            label=f"{stage2_name} Best Val Acc",
+        )
+        axes[1].scatter(
+            stage1_final[epoch_col],
+            stage1_final["val_loss"],
+            marker="D",
+            s=90,
+            zorder=5,
+            label=f"{stage1_name} End",
+        )
+        axes[1].scatter(
+            stage2_final[epoch_col],
+            stage2_final["val_loss"],
+            marker="D",
+            s=90,
+            zorder=5,
+            label=f"{stage2_name} End",
+        )
+        axes[1].set_title("Val Loss")
+        axes[1].set_xlabel(epoch_label)
+        axes[1].set_ylabel("Loss")
+        axes[1].set_xticks(xticks)
+        axes[1].grid(True, linestyle="--", alpha=0.4)
+        axes[1].legend()
 
-    # Panel 3: validation accuracy with best-epoch and final-epoch markers.
-    axes[2].plot(
-        stage1_history[epoch_col],
-        stage1_history["val_acc"],
-        marker="o",
-        linewidth=2,
-        label=f"{stage1_name} Val Acc",
-    )
-    axes[2].plot(
-        stage2_history[epoch_col],
-        stage2_history["val_acc"],
-        marker="s",
-        linewidth=2,
-        label=f"{stage2_name} Val Acc",
-    )
-    axes[2].scatter(
-        stage1_best[epoch_col],
-        stage1_best["val_acc"],
-        marker="*",
-        s=160,
-        zorder=5,
-        label=f"{stage1_name} Best",
-    )
-    axes[2].scatter(
-        stage2_best[epoch_col],
-        stage2_best["val_acc"],
-        marker="*",
-        s=160,
-        zorder=5,
-        label=f"{stage2_name} Best",
-    )
-    axes[2].scatter(
-        stage1_final[epoch_col],
-        stage1_final["val_acc"],
-        marker="D",
-        s=90,
-        zorder=5,
-        label=f"{stage1_name} End",
-    )
-    axes[2].scatter(
-        stage2_final[epoch_col],
-        stage2_final["val_acc"],
-        marker="D",
-        s=90,
-        zorder=5,
-        label=f"{stage2_name} End",
-    )
-    axes[2].set_title("Val Accuracy")
-    axes[2].set_xlabel(epoch_label)
-    axes[2].set_ylabel("Accuracy")
-    axes[2].set_xticks(xticks)
-    axes[2].grid(True, linestyle="--", alpha=0.4)
-    axes[2].legend()
+        # Panel 3: validation accuracy with best-epoch and final-epoch markers.
+        axes[2].plot(
+            stage1_history[epoch_col],
+            stage1_history["val_acc"],
+            marker="o",
+            linewidth=2,
+            label=f"{stage1_name} Val Acc",
+        )
+        axes[2].plot(
+            stage2_history[epoch_col],
+            stage2_history["val_acc"],
+            marker="s",
+            linewidth=2,
+            label=f"{stage2_name} Val Acc",
+        )
+        axes[2].scatter(
+            stage1_best[epoch_col],
+            stage1_best["val_acc"],
+            marker="*",
+            s=160,
+            zorder=5,
+            label=f"{stage1_name} Best",
+        )
+        axes[2].scatter(
+            stage2_best[epoch_col],
+            stage2_best["val_acc"],
+            marker="*",
+            s=160,
+            zorder=5,
+            label=f"{stage2_name} Best",
+        )
+        axes[2].scatter(
+            stage1_final[epoch_col],
+            stage1_final["val_acc"],
+            marker="D",
+            s=90,
+            zorder=5,
+            label=f"{stage1_name} End",
+        )
+        axes[2].scatter(
+            stage2_final[epoch_col],
+            stage2_final["val_acc"],
+            marker="D",
+            s=90,
+            zorder=5,
+            label=f"{stage2_name} End",
+        )
+        axes[2].set_title("Val Accuracy")
+        axes[2].set_xlabel(epoch_label)
+        axes[2].set_ylabel("Accuracy")
+        axes[2].set_xticks(xticks)
+        axes[2].grid(True, linestyle="--", alpha=0.4)
+        axes[2].legend()
 
-    # Panel 4: compact bar chart of the metrics most likely to be cited later.
-    comparison_plot_df = pd.DataFrame(
-        {
-            "metric": ["Best Val Acc", "Final Val Acc", "Best Val Loss", "Final Val Loss"],
-            stage1_name: [
-                stage1_best["val_acc"],
-                stage1_final["val_acc"],
-                stage1_best["val_loss"],
-                stage1_final["val_loss"],
-            ],
-            stage2_name: [
-                stage2_best["val_acc"],
-                stage2_final["val_acc"],
-                stage2_best["val_loss"],
-                stage2_final["val_loss"],
-            ],
-        }
-    )
-    comparison_plot_df = comparison_plot_df.set_index("metric")
-    comparison_plot_df.plot(kind="bar", ax=axes[3], width=0.75)
-    axes[3].set_title("Best / Final Metric Summary")
-    axes[3].set_xlabel("")
-    axes[3].grid(True, axis="y", linestyle="--", alpha=0.4)
-    axes[3].legend()
+        # Panel 4: compact bar chart of the metrics most likely to be cited later.
+        comparison_plot_df = pd.DataFrame(
+            {
+                "metric": ["Best Val Acc", "Final Val Acc", "Best Val Loss", "Final Val Loss"],
+                stage1_name: [
+                    stage1_best["val_acc"],
+                    stage1_final["val_acc"],
+                    stage1_best["val_loss"],
+                    stage1_final["val_loss"],
+                ],
+                stage2_name: [
+                    stage2_best["val_acc"],
+                    stage2_final["val_acc"],
+                    stage2_best["val_loss"],
+                    stage2_final["val_loss"],
+                ],
+            }
+        )
+        comparison_plot_df = comparison_plot_df.set_index("metric")
+        comparison_plot_df.plot(kind="bar", ax=axes[3], width=0.75)
+        axes[3].set_title("Best / Final Metric Summary")
+        axes[3].set_xlabel("")
+        axes[3].grid(True, axis="y", linestyle="--", alpha=0.4)
+        axes[3].legend()
 
-    plt.suptitle(f"{stage1_name} vs {stage2_name}", fontsize=15)
-    plt.tight_layout()
-    _remember_figure(fig)
-    plt.show()
+        plt.suptitle(f"{stage1_name} vs {stage2_name}", fontsize=15)
+        plt.tight_layout()
+        _remember_figure(fig)
+        plt.show()
 
     if print_summary:
         print("=== Stage Training Summary ===")
         print(summary_df.to_string(index=False))
 
-    return {
-        "summary": summary_df,
-        "stage1_history": stage1_history,
-        "stage2_history": stage2_history,
-        "fig": fig,
-        "axes": axes,
-    }
-
-# Build a `name -> parameter` mapping for comparison helpers.
-def _collect_named_parameters(model):
-    if not hasattr(model, "named_parameters"):
-        raise TypeError("`model` must be a PyTorch/Lightning module with `named_parameters()`.")
-
-    return {name: parameter for name, parameter in model.named_parameters()}
-
-# Summarize parameter counts for one model.
-def _build_model_summary(model, model_name):
-    parameter_map = _collect_named_parameters(model)
-    # Count both raw parameter volume and how much of it is trainable.
-    total_params = sum(parameter.numel() for parameter in parameter_map.values())
-    trainable_params = sum(
-        parameter.numel() for parameter in parameter_map.values() if parameter.requires_grad
-    )
-    frozen_params = total_params - trainable_params
-
-    return {
-        "model_name": model_name,
-        "module_class": model.__class__.__name__,
-        "parameter_tensors": len(parameter_map),
-        "total_params": total_params,
-        "trainable_params": trainable_params,
-        "frozen_params": frozen_params,
-        "trainable_ratio": trainable_params / total_params if total_params else 0.0,
-    }
-
-# Compare trainable flags, weights, and shared storage between two models.
-def compare_stage_models(
-    stage1_model,
-    stage2_model,
-    stage1_name="Stage 1",
-    stage2_name="Stage 2",
-    only_differences=True,
-    compare_weights=True,
-    compare_requires_grad=True,
-    max_changed_parameters=20,
-    atol=0.0,
-    rtol=0.0,
-    verbose=True,
-):
-    stage1_params = _collect_named_parameters(stage1_model)
-    stage2_params = _collect_named_parameters(stage2_model)
-
-    # Split parameter names into shared vs stage-specific groups first.
-    common_names = sorted(set(stage1_params) & set(stage2_params))
-    only_stage1 = sorted(set(stage1_params) - set(stage2_params))
-    only_stage2 = sorted(set(stage2_params) - set(stage1_params))
-
-    # Start with two model summaries, then append one comparison row.
-    summary_rows = [
-        _build_model_summary(stage1_model, stage1_name),
-        _build_model_summary(stage2_model, stage2_name),
-    ]
-    summary_rows.append(
-        {
-            "model_name": "Comparison",
-            "module_class": f"{len(common_names)} shared parameter names",
-            "parameter_tensors": len(common_names),
-            "total_params": len(only_stage1),
-            "trainable_params": len(only_stage2),
-            "frozen_params": 0,
-            "trainable_ratio": None,
+    if return_details:
+        return {
+            "summary": summary_df,
+            "stage1_history": stage1_history,
+            "stage2_history": stage2_history,
+            "fig": fig,
+            "axes": axes,
         }
-    )
-    summary_df = pd.DataFrame(summary_rows)
-    summary_df = summary_df.rename(
-        columns={
-            "total_params": "only_in_stage1",
-            "trainable_params": "only_in_stage2",
-            "frozen_params": "unused",
-        }
-    )
-    summary_df.loc[summary_df["model_name"] != "Comparison", "only_in_stage1"] = [
-        _build_model_summary(stage1_model, stage1_name)["total_params"],
-        _build_model_summary(stage2_model, stage2_name)["total_params"],
+
+    return summary_df
+
+# Check whether a local TCP port is already accepting connections.
+def _is_port_open(host, port):
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.settimeout(0.5)
+        return sock.connect_ex((host, port)) == 0
+
+# Start a local MLflow UI process in the background and print an openable link.
+def start_mlflow_ui(tracking_dir=None, host="127.0.0.1", port=5000, timeout=15):
+    project_root = Path(__file__).resolve().parent.parent
+    mlruns_dir = Path(tracking_dir or (project_root / "artifacts" / "mlruns")).resolve()
+    mlruns_dir.mkdir(parents=True, exist_ok=True)
+
+    if _is_port_open(host, port):
+        url = f"http://{host}:{port}"
+        print("MLflow UI appears to already be running.")
+        if display is not None and HTML is not None:
+            display(HTML(f'Access from: <a href="{url}" target="_blank">Open MLflow UI</a>'))
+        else:
+            print(f"Access from: {url}")
+        return None
+
+    # Launch MLflow through the current Python interpreter so the notebook uses
+    # the same environment that already has the project dependencies installed.
+    command = [
+        sys.executable,
+        "-m",
+        "mlflow",
+        "ui",
+        "--backend-store-uri",
+        f"file:{mlruns_dir}",
+        "--host",
+        host,
+        "--port",
+        str(port),
     ]
-    summary_df.loc[summary_df["model_name"] != "Comparison", "only_in_stage2"] = [
-        _build_model_summary(stage1_model, stage1_name)["trainable_params"],
-        _build_model_summary(stage2_model, stage2_name)["trainable_params"],
-    ]
-    summary_df.loc[summary_df["model_name"] != "Comparison", "unused"] = [
-        _build_model_summary(stage1_model, stage1_name)["frozen_params"],
-        _build_model_summary(stage2_model, stage2_name)["frozen_params"],
-    ]
-    summary_df = summary_df.rename(
-        columns={
-            "only_in_stage1": "total_params",
-            "only_in_stage2": "trainable_params",
-            "unused": "frozen_params",
-        }
+
+    print("Starting MLflow UI...")
+    mlflow_process = subprocess.Popen(
+        command,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
     )
-    summary_df["stage1_only_parameter_names"] = [None, None, only_stage1]
-    summary_df["stage2_only_parameter_names"] = [None, None, only_stage2]
 
-    requires_grad_rows = []
-    parameter_change_rows = []
-    shared_parameter_rows = []
+    print("Waiting for server to start...")
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if mlflow_process.poll() is not None:
+            raise RuntimeError("MLflow UI failed to start. Check that `mlflow` is installed correctly.")
+        if _is_port_open(host, port):
+            break
+        time.sleep(0.25)
+    else:
+        mlflow_process.terminate()
+        raise TimeoutError("Timed out while waiting for the MLflow UI server to start.")
 
-    for name in common_names:
-        stage1_parameter = stage1_params[name]
-        stage2_parameter = stage2_params[name]
+    url = f"http://{host}:{port}"
+    divider = "=" * 58
 
-        # `same_storage` catches accidental sharing between Stage 1 and Stage 2 models.
-        same_shape = tuple(stage1_parameter.shape) == tuple(stage2_parameter.shape)
-        same_storage = (
-            same_shape
-            and stage1_parameter.detach().data_ptr() == stage2_parameter.detach().data_ptr()
-        )
+    print()
+    print(divider)
+    print("MLflow UI is running in the background!")
+    print(divider)
 
-        if compare_requires_grad:
-            requires_grad_rows.append(
-                {
-                    "parameter_name": name,
-                    "shape": tuple(stage1_parameter.shape),
-                    "numel": stage1_parameter.numel(),
-                    f"{stage1_name}_requires_grad": stage1_parameter.requires_grad,
-                    f"{stage2_name}_requires_grad": stage2_parameter.requires_grad,
-                    "requires_grad_changed": (
-                        stage1_parameter.requires_grad != stage2_parameter.requires_grad
-                    ),
-                    "same_storage": same_storage,
-                }
-            )
+    if display is not None and HTML is not None:
+        display(HTML(f'Access from: <a href="{url}" target="_blank">Open MLflow UI</a>'))
+    else:
+        print(f"Access from: {url}")
 
-        if same_storage:
-            shared_parameter_rows.append(
-                {
-                    "parameter_name": name,
-                    "shape": tuple(stage1_parameter.shape),
-                    "numel": stage1_parameter.numel(),
-                    "same_storage": True,
-                }
-            )
+    print()
+    print("The server is running in the background. You can continue with the notebook.")
+    print("To stop the server later, run: mlflow_process.terminate()")
+    print(divider)
 
-        if compare_weights:
-            if not same_shape:
-                parameter_change_rows.append(
-                    {
-                        "parameter_name": name,
-                        "shape": f"{tuple(stage1_parameter.shape)} vs {tuple(stage2_parameter.shape)}",
-                        "numel": None,
-                        "same_storage": same_storage,
-                        "allclose": False,
-                        "max_abs_diff": None,
-                        "mean_abs_diff": None,
-                        "l2_diff": None,
-                        f"{stage1_name}_requires_grad": stage1_parameter.requires_grad,
-                        f"{stage2_name}_requires_grad": stage2_parameter.requires_grad,
-                    }
-                )
-                continue
-
-            # Compare on CPU float tensors so this works regardless of training device.
-            stage1_tensor = stage1_parameter.detach().float().cpu()
-            stage2_tensor = stage2_parameter.detach().float().cpu()
-            diff = (stage1_tensor - stage2_tensor).abs()
-
-            parameter_change_rows.append(
-                {
-                    "parameter_name": name,
-                    "shape": tuple(stage1_parameter.shape),
-                    "numel": stage1_parameter.numel(),
-                    "same_storage": same_storage,
-                    "allclose": torch.allclose(
-                        stage1_tensor,
-                        stage2_tensor,
-                        atol=atol,
-                        rtol=rtol,
-                    ),
-                    "max_abs_diff": float(diff.max().item()) if diff.numel() else 0.0,
-                    "mean_abs_diff": float(diff.mean().item()) if diff.numel() else 0.0,
-                    "l2_diff": float(torch.linalg.vector_norm((stage1_tensor - stage2_tensor).reshape(-1)).item()),
-                    f"{stage1_name}_requires_grad": stage1_parameter.requires_grad,
-                    f"{stage2_name}_requires_grad": stage2_parameter.requires_grad,
-                }
-            )
-
-    # Sort the comparison tables so the most interesting differences appear first.
-    requires_grad_df = pd.DataFrame(requires_grad_rows)
-    if not requires_grad_df.empty:
-        requires_grad_df = requires_grad_df.sort_values(
-            by=["requires_grad_changed", "numel", "parameter_name"],
-            ascending=[False, False, True],
-        )
-        if only_differences:
-            requires_grad_df = requires_grad_df[requires_grad_df["requires_grad_changed"]].copy()
-
-    parameter_changes_df = pd.DataFrame(parameter_change_rows)
-    if not parameter_changes_df.empty:
-        parameter_changes_df = parameter_changes_df.sort_values(
-            by=["same_storage", "l2_diff", "max_abs_diff", "parameter_name"],
-            ascending=[True, False, False, True],
-            na_position="last",
-        )
-        if only_differences:
-            parameter_changes_df = parameter_changes_df[
-                (~parameter_changes_df["allclose"]) | (parameter_changes_df["same_storage"])
-            ].copy()
-        if max_changed_parameters is not None:
-            parameter_changes_df = parameter_changes_df.head(max_changed_parameters).copy()
-
-    shared_parameters_df = pd.DataFrame(shared_parameter_rows)
-    if not shared_parameters_df.empty:
-        shared_parameters_df = shared_parameters_df.sort_values(
-            by=["numel", "parameter_name"],
-            ascending=[False, True],
-        )
-
-    # Return DataFrames so notebook cells can inspect only the table they need.
-    results = {
-        "summary": summary_df,
-        "requires_grad": requires_grad_df.reset_index(drop=True),
-        "parameter_changes": parameter_changes_df.reset_index(drop=True),
-        "shared_parameters": shared_parameters_df.reset_index(drop=True),
-    }
-
-    if verbose:
-        print("=== Model Comparison Summary ===")
-        print(summary_df[["model_name", "module_class", "parameter_tensors", "total_params", "trainable_params", "frozen_params", "trainable_ratio"]].to_string(index=False))
-        print(f"\nShared parameter names: {len(common_names)}")
-        print(f"Stage 1-only parameter names: {len(only_stage1)}")
-        print(f"Stage 2-only parameter names: {len(only_stage2)}")
-        print(f"Parameters with changed requires_grad: {len(requires_grad_df)}")
-        print(f"Reported parameter tensor changes: {len(parameter_changes_df)}")
-        print(f"Parameters sharing the same storage: {len(shared_parameters_df)}")
-
-    return results
+    return mlflow_process
