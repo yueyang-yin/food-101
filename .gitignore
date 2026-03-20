@@ -37,7 +37,6 @@ logs/
 outputs/
 
 # Deep learning artifacts
-artifacts/
 checkpoints/
 models/
 weights/
