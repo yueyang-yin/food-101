@@ -14,6 +14,8 @@ from torchmetrics.classification import Accuracy
 try:
     import lightning.pytorch as pl
 except ModuleNotFoundError:
+    # Keep the notebooks usable in environments that still depend on the older
+    # `pytorch_lightning` package name.
     import pytorch_lightning as pl
 
 
@@ -22,6 +24,8 @@ def _call_with_supported_kwargs(fn: Callable[..., Any], **kwargs: Any) -> Any:
     try:
         signature = inspect.signature(fn)
     except (TypeError, ValueError):
+        # Builtins or C-extension callables may not expose a Python signature.
+        # In that case we fall back to a direct call and let Python raise naturally.
         return fn(**kwargs)
 
     parameters = signature.parameters
@@ -30,14 +34,19 @@ def _call_with_supported_kwargs(fn: Callable[..., Any], **kwargs: Any) -> Any:
         for parameter in parameters.values()
     )
     if accepts_var_kwargs:
+        # When the callable already accepts arbitrary keyword arguments there is
+        # nothing to filter, so we can pass the full context through unchanged.
         return fn(**kwargs)
 
+    # Keep only the keyword arguments that the target callable explicitly declares.
     supported_kwargs = {
         name: value
         for name, value in kwargs.items()
         if name in parameters
     }
 
+    # Surface missing required keyword arguments early with an error message that
+    # points to the actual factory function instead of failing deeper inside it.
     missing_required = [
         name
         for name, parameter in parameters.items()
@@ -63,12 +72,18 @@ def _normalize_scheduler_config(
 ) -> dict[str, Any]:
     """Normalize Lightning scheduler configs and inject `monitor` when required."""
     if isinstance(scheduler_config, Mapping):
+        # Copy to a plain dict so downstream code can mutate safely without
+        # affecting the caller's original configuration object.
         normalized_config = dict(scheduler_config)
         scheduler = normalized_config.get("scheduler")
+        # ReduceLROnPlateau is special in Lightning: it must know which logged
+        # metric to watch, otherwise training setup fails at runtime.
         if isinstance(scheduler, ReduceLROnPlateau) and "monitor" not in normalized_config:
             normalized_config["monitor"] = monitor
         return normalized_config
 
+    # Lightning also accepts a bare scheduler instance, so wrap it into the
+    # dict shape it expects when paired with an optimizer config dict.
     normalized_config = {"scheduler": scheduler_config}
     if isinstance(scheduler_config, ReduceLROnPlateau):
         normalized_config["monitor"] = monitor
@@ -81,15 +96,20 @@ def _normalize_optimizer_config(
 ) -> Any:
     """Convert several optimizer/scheduler return shapes into Lightning format."""
     if isinstance(optimizer_config, Optimizer):
+        # The simplest case: the factory already returned a ready-to-use optimizer.
         return optimizer_config
 
     if isinstance(optimizer_config, tuple):
         if len(optimizer_config) == 1:
+            # Preserve backward compatibility with helpers that return `(optimizer,)`.
             return optimizer_config[0]
 
         if len(optimizer_config) == 2:
+            # Interpret two-tuples as `(optimizer, scheduler)` because that is the
+            # most common compact return shape used in notebooks.
             optimizer, scheduler = optimizer_config
             if scheduler is None:
+                # Treat `(optimizer, None)` the same as returning the optimizer alone.
                 return optimizer
 
             return {
@@ -98,12 +118,16 @@ def _normalize_optimizer_config(
             }
 
         if len(optimizer_config) == 3:
+            # The third element lets a helper override which metric a scheduler
+            # should monitor without rebuilding the full Lightning config dict.
             optimizer, scheduler, custom_monitor = optimizer_config
             if scheduler is None:
                 return optimizer
 
             return {
                 "optimizer": optimizer,
+                # Prefer an explicit monitor returned by the factory, but fall back
+                # to the module default so ReduceLROnPlateau still works.
                 "lr_scheduler": _normalize_scheduler_config(
                     scheduler,
                     custom_monitor or monitor,
@@ -116,6 +140,7 @@ def _normalize_optimizer_config(
             "(optimizer, scheduler, monitor)."
         )
 
+    # If the caller already returned a Lightning-native config dict, keep it as-is.
     return optimizer_config
 
 
@@ -146,8 +171,11 @@ class FlexibleFood101Classifier(pl.LightningModule):
         self.optimizer_scheduler_fn = optimizer_scheduler_fn
 
         if model is not None:
+            # Allow callers to pass a fully constructed backbone directly.
             self.model = model
         elif load_model_fn is not None:
+            # Factories across notebooks do not all share the same signature, so
+            # pass a rich context and let `_call_with_supported_kwargs` trim it.
             self.model = _call_with_supported_kwargs(
                 load_model_fn,
                 num_classes=num_classes,
@@ -160,33 +188,48 @@ class FlexibleFood101Classifier(pl.LightningModule):
         if optimizer_scheduler_fn is None:
             raise ValueError("You must provide `optimizer_scheduler_fn`.")
 
+        # Keep loss and metrics on the module so all steps share the same
+        # training/validation/test bookkeeping setup.
         self.loss_fn = nn.CrossEntropyLoss()
+        # Reuse one metric object so Lightning can aggregate validation/test
+        # accuracy across batches and epochs consistently.
         self.accuracy = Accuracy(task="multiclass", num_classes=num_classes)
 
     def forward(self, x):
         """Run a forward pass through the wrapped backbone."""
+        # Delegate to the wrapped model so notebook code can still treat this
+        # LightningModule like the original backbone during inference.
         return self.model(x)
 
     def training_step(self, batch, batch_idx=None):
         """Compute and log training loss for one batch."""
+        # Lightning dataloaders conventionally return `(inputs, labels)`.
         x, y = batch
         logits = self(x)
         loss = self.loss_fn(logits, y)
+        # Notebook progress bars are cleaner when training loss is shown once per
+        # epoch instead of being updated on every optimization step.
         self.log("train_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         return loss
 
     def validation_step(self, batch, batch_idx=None):
         """Compute and log validation loss plus accuracy for one batch."""
+        # Validation mirrors training, but also records accuracy because model
+        # selection in the notebooks usually depends on validation performance.
         x, y = batch
         logits = self(x)
         loss = self.loss_fn(logits, y)
         acc = self.accuracy(logits, y)
 
+        # `val_loss` is also the default monitor consumed by optimizer/scheduler
+        # factories through `configure_optimizers`.
         self.log("val_loss", loss, prog_bar=True, on_step=False, on_epoch=True)
         self.log("val_acc", acc, prog_bar=True, on_step=False, on_epoch=True)
 
     def test_step(self, batch, batch_idx=None):
         """Compute and log test loss plus accuracy for one batch."""
+        # Test logging matches validation naming conventions so downstream plots
+        # and summaries can read them predictably.
         x, y = batch
         logits = self(x)
         loss = self.loss_fn(logits, y)
@@ -197,6 +240,8 @@ class FlexibleFood101Classifier(pl.LightningModule):
 
     def configure_optimizers(self):
         """Build the optimizer configuration expected by Lightning."""
+        # Pass both the wrapped backbone and the LightningModule itself so helper
+        # factories can choose the abstraction level they want to work with.
         optimizer_config = _call_with_supported_kwargs(
             self.optimizer_scheduler_fn,
             model=self.model,
@@ -206,11 +251,15 @@ class FlexibleFood101Classifier(pl.LightningModule):
             learning_rate=self.hparams.learning_rate,
             weight_decay=self.hparams.weight_decay,
         )
+        # Normalize the return shape because notebook helpers may return either a
+        # bare optimizer, a tuple, or a full Lightning config dict.
         return _normalize_optimizer_config(optimizer_config, monitor="val_loss")
 
 
 def Create_flexible_Food101Classifier(**kwargs: Any) -> FlexibleFood101Classifier:
     """Preserve the notebook's original constructor name for backward compatibility."""
+    # Keep the old factory-like notebook API working after the refactor to a
+    # class-based implementation.
     return FlexibleFood101Classifier(**kwargs)
 
 
