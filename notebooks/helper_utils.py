@@ -1,4 +1,4 @@
-# Helper utilities used by the Food-101 notebook.
+"""Helper utilities used by the Food-101 notebooks."""
 
 from collections import Counter
 import math
@@ -16,56 +16,31 @@ import torch
 try:
     from IPython.display import HTML, display
 except Exception:
+    # Fall back to plain-text messages when IPython rich display is unavailable.
     HTML = None
     display = None
 
-# Accepted image extensions when scanning folder-based datasets.
-IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp"}
 
-# Supported split names across different dataset layouts.
-SPLIT_NAMES = ("train", "val", "valid", "validation", "test")
-
-# Remember the most recently rendered figure so notebook save cells can still
-# work even when `plt.show()` has already run in a previous cell.
+IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
 _LAST_RENDERED_FIGURE = None
 
-# Resolve the actual dataset root from either the dataset folder itself
-# or a parent directory that contains the dataset as a child folder.
+
 def _resolve_dataset_root(data_dir):
+    """Return the Food-101 dataset root from either the root itself or its parent."""
     data_dir = Path(data_dir)
 
-    if (data_dir / "meta" / "train.txt").exists() or (data_dir / "train").is_dir():
+    if (data_dir / "meta" / "train.txt").exists():
         return data_dir
 
     for child in sorted(data_dir.iterdir()):
-        if not child.is_dir():
-            continue
-        if (child / "meta" / "train.txt").exists() or (child / "train").is_dir():
+        if child.is_dir() and (child / "meta" / "train.txt").exists():
             return child
 
-    raise FileNotFoundError(f"No supported dataset structure found under: {data_dir}")
+    raise FileNotFoundError(f"No Food-101 dataset root found under: {data_dir}")
 
-# Accept flexible notebook inputs like `../data`, `../data/train`,
-# or even string concatenations such as `data_dir + "train"`.
-def _resolve_dataset_root_and_split(data_dir, default_split="train"):
-    raw_path = str(data_dir).rstrip("/\\")
-    path_obj = Path(raw_path)
 
-    if path_obj.exists():
-        if path_obj.is_dir() and path_obj.name in SPLIT_NAMES:
-            return path_obj.parent, path_obj.name
-        return _resolve_dataset_root(path_obj), default_split
-
-    for split_name in SPLIT_NAMES:
-        if raw_path.endswith(split_name):
-            base_path = raw_path[: -len(split_name)].rstrip("/\\")
-            if base_path and Path(base_path).exists():
-                return _resolve_dataset_root(base_path), split_name
-
-    raise FileNotFoundError(f"Cannot resolve dataset path or split from: {data_dir}")
-
-# Count class frequency from metadata files such as Food-101 `meta/train.txt`.
 def _count_from_meta_split(dataset_root, split_name):
+    """Count images per class from a metadata split file such as `train.txt`."""
     split_file = dataset_root / "meta" / f"{split_name}.txt"
     if not split_file.exists():
         return None
@@ -74,31 +49,18 @@ def _count_from_meta_split(dataset_root, split_name):
     counts = Counter(line.split("/")[0] for line in lines)
     return dict(sorted(counts.items()))
 
-# Count class frequency from a standard split/class/image directory tree.
-def _count_from_folder_split(dataset_root, split_name):
-    split_dir = dataset_root / split_name
-    if not split_dir.is_dir():
-        return None
 
-    counts = {}
-    for class_dir in sorted(path for path in split_dir.iterdir() if path.is_dir()):
-        counts[class_dir.name] = sum(
-            1
-            for file_path in class_dir.iterdir()
-            if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS
-        )
-    return counts
-
-# Turn a metadata stem like `apple_pie/1005649` into an actual image path.
 def _resolve_meta_image_path(images_root, relative_stem):
+    """Resolve one metadata entry to an on-disk image path across known extensions."""
     for extension in IMAGE_EXTENSIONS:
         image_path = images_root / f"{relative_stem}{extension}"
         if image_path.exists():
             return image_path
     raise FileNotFoundError(f"Image file not found for metadata entry: {relative_stem}")
 
-# Build `{class_name: [image_paths...]}` from metadata-defined splits.
+
 def _image_map_from_meta_split(dataset_root, split_name):
+    """Build a `{class_name: [image_path, ...]}` mapping for a metadata split."""
     split_file = dataset_root / "meta" / f"{split_name}.txt"
     if not split_file.exists():
         return None
@@ -115,34 +77,12 @@ def _image_map_from_meta_split(dataset_root, split_name):
 
     return dict(sorted(image_map.items()))
 
-# Build `{class_name: [image_paths...]}` from folder-defined splits.
-def _image_map_from_folder_split(dataset_root, split_name):
-    split_dir = dataset_root / split_name
-    if not split_dir.is_dir():
-        return None
 
-    image_map = {}
-    for class_dir in sorted(path for path in split_dir.iterdir() if path.is_dir()):
-        image_paths = sorted(
-            file_path
-            for file_path in class_dir.iterdir()
-            if file_path.is_file() and file_path.suffix.lower() in IMAGE_EXTENSIONS
-        )
-        image_map[class_dir.name] = image_paths
-
-    return image_map
-
-# Print image counts for each available split so the notebook can quickly
-# verify class balance and total dataset size.
 def display_dataset_count(data_dir):
+    """Print per-class image counts for the available Food-101 metadata splits."""
     dataset_root = _resolve_dataset_root(data_dir)
-    # Check several common split names because different datasets organize
-    # validation data as `val`, `valid`, or `validation`.
     split_candidates = [
         ("train", "Train Set"),
-        ("val", "Val Set"),
-        ("valid", "Valid Set"),
-        ("validation", "Validation Set"),
         ("test", "Test Set"),
     ]
 
@@ -150,8 +90,6 @@ def display_dataset_count(data_dir):
 
     for split_key, split_title in split_candidates:
         counts = _count_from_meta_split(dataset_root, split_key)
-        if counts is None:
-            counts = _count_from_folder_split(dataset_root, split_key)
         if counts is None:
             continue
 
@@ -166,16 +104,15 @@ def display_dataset_count(data_dir):
         print(f"Total: {total} images\n")
 
     if not found_any_split:
-        raise ValueError(f"No train/val/test style splits found in: {dataset_root}")
+        raise ValueError(f"No Food-101 metadata splits found in: {dataset_root}")
 
-# Show a small random gallery from the training split for visual sanity checks.
+
 def display_random_images(data_dir, num_classes=3, images_per_class=2, random_seed=None):
-    dataset_root, split_name = _resolve_dataset_root_and_split(data_dir, default_split="train")
-    image_map = _image_map_from_meta_split(dataset_root, split_name)
+    """Display a small random gallery from the Food-101 training split."""
+    dataset_root = _resolve_dataset_root(data_dir)
+    image_map = _image_map_from_meta_split(dataset_root, "train")
     if image_map is None:
-        image_map = _image_map_from_folder_split(dataset_root, split_name)
-    if image_map is None:
-        raise ValueError(f"No readable image split found for '{split_name}' in: {dataset_root}")
+        raise ValueError(f"No readable Food-101 training split found in: {dataset_root}")
 
     eligible_classes = [
         class_name
@@ -191,7 +128,6 @@ def display_random_images(data_dir, num_classes=3, images_per_class=2, random_se
     rng = random.Random(random_seed)
     selected_classes = rng.sample(eligible_classes, num_classes)
 
-    # Keep the layout deterministic and notebook-friendly.
     fig, axes = plt.subplots(
         nrows=num_classes,
         ncols=images_per_class,
@@ -210,33 +146,38 @@ def display_random_images(data_dir, num_classes=3, images_per_class=2, random_se
 
     plt.show()
 
-# Peel off wrappers like `Subset` until the underlying dataset is reached.
+
 def _unwrap_dataset(dataset):
+    """Peel nested dataset wrappers until the base dataset is reached."""
     while hasattr(dataset, "dataset"):
         dataset = dataset.dataset
     return dataset
 
-# Read class names from the underlying torchvision-style dataset.
+
 def _resolve_class_names(dataset):
+    """Extract class names from a dataset or subset backed by torchvision datasets."""
     base_dataset = _unwrap_dataset(dataset)
     if hasattr(base_dataset, "classes"):
         return list(base_dataset.classes)
     raise ValueError("Cannot resolve class names from the provided dataset.")
 
-# Undo normalization before plotting tensors as RGB images.
+
 def _denormalize_image(image_tensor, mean, std):
+    """Undo channel-wise normalization so a tensor can be plotted correctly."""
     mean_tensor = torch.tensor(mean, device=image_tensor.device).view(3, 1, 1)
     std_tensor = torch.tensor(std, device=image_tensor.device).view(3, 1, 1)
     return (image_tensor * std_tensor + mean_tensor).clamp(0, 1)
 
-# Cache the latest figure produced by a plotting helper.
+
 def _remember_figure(fig):
+    """Cache the latest rendered figure so later save calls can reuse it."""
     global _LAST_RENDERED_FIGURE
     _LAST_RENDERED_FIGURE = fig
     return fig
 
-# Resolve which figure should actually be saved.
+
 def _resolve_figure_for_saving(fig=None):
+    """Return the explicit figure, the cached figure, or the current active figure."""
     if fig is not None:
         return fig
 
@@ -257,8 +198,9 @@ def _resolve_figure_for_saving(fig=None):
         "Pass `fig=...` explicitly or rerun the plotting cell first."
     )
 
-# Sample validation images, run inference, and show predicted vs true labels.
+
 def _require_inference_model(model):
+    """Validate that the supplied object behaves like a PyTorch inference model."""
     if hasattr(model, "eval") and hasattr(model, "parameters"):
         return model
 
@@ -274,8 +216,6 @@ def _require_inference_model(model):
     )
 
 
-# Draw a small validation gallery with model predictions so notebook readers can
-# qualitatively inspect what the checkpoint gets right and wrong.
 def show_random_validation_predictions(
     model,
     data_module,
@@ -287,8 +227,8 @@ def show_random_validation_predictions(
     max_cols=4,
     figsize=None,
 ):
+    """Plot random validation samples with predicted and ground-truth labels."""
     if getattr(data_module, "val_dataset", None) is None:
-        # Lazily initialize the validation split if the datamodule has not been set up yet.
         data_module.setup(stage="fit")
 
     val_dataset = data_module.val_dataset
@@ -307,7 +247,7 @@ def show_random_validation_predictions(
     selected_indices = rng.sample(range(dataset_size), num_images)
 
     model = _require_inference_model(model)
-    was_training = getattr(model, "training", False)  # restore the original mode afterwards
+    was_training = getattr(model, "training", False)
     model.eval()
 
     try:
@@ -320,14 +260,12 @@ def show_random_validation_predictions(
     if figsize is None:
         figsize = (cols * 4.5, rows * 4.5)
 
-    # Always create a 2D axes array so the loop logic stays simple.
     fig, axes = plt.subplots(rows, cols, figsize=figsize, squeeze=False)
     flat_axes = axes.flatten()
 
     try:
         with torch.inference_mode():
             for axis, sample_idx in zip(flat_axes, selected_indices):
-                # Pull one sample, run a forward pass, and keep only the top class.
                 image_tensor, true_label = val_dataset[sample_idx]
                 logits = model(image_tensor.unsqueeze(0).to(device))
                 pred_label = int(logits.argmax(dim=1).item())
@@ -335,7 +273,7 @@ def show_random_validation_predictions(
                 display_image = _denormalize_image(
                     image_tensor.detach().cpu(),
                     denormalize_mean,
-                    denormalize_std,  # undo ImageNet normalization for plotting
+                    denormalize_std,
                 ).permute(1, 2, 0)
 
                 axis.imshow(display_image)
@@ -360,7 +298,7 @@ def show_random_validation_predictions(
     plt.show()
     return fig, axes
 
-# Save a Matplotlib figure into `artifacts/figures` by default.
+
 def save_figure_to_artifacts(
     filename,
     fig=None,
@@ -369,11 +307,11 @@ def save_figure_to_artifacts(
     bbox_inches="tight",
     transparent=False,
 ):
+    """Save a Matplotlib figure under `artifacts/<artifact_subdir>/`."""
     project_root = Path(__file__).resolve().parent.parent
     output_dir = project_root / "artifacts" / artifact_subdir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Allow callers to pass either `figure_name` or `figure_name.png`.
     output_path = Path(filename)
     if output_path.suffix == "":
         output_path = output_path.with_suffix(".png")
@@ -389,8 +327,9 @@ def save_figure_to_artifacts(
     )
     return save_path
 
-# Collapse Lightning's per-step/per-epoch CSV rows into one clean row per epoch.
+
 def _build_epoch_history(df, one_based_epoch=True):
+    """Collapse MLflow metric rows into one row per completed epoch."""
     history = (
         df.groupby("epoch", as_index=False)
         .agg({
@@ -400,7 +339,6 @@ def _build_epoch_history(df, one_based_epoch=True):
         })
         .sort_values("epoch")
     )
-    # Keep only rows that correspond to completed training epochs.
     history = history[history["train_loss"].notna()].copy()
 
     if history.empty:
@@ -411,9 +349,8 @@ def _build_epoch_history(df, one_based_epoch=True):
     return history, epoch_col
 
 
-# Locate the project's MLflow store without requiring every notebook cell to
-# pass an explicit tracking URI.
 def _default_mlflow_tracking_uri():
+    """Return the default local MLflow tracking URI used by this project."""
     project_root = Path(__file__).resolve().parent.parent
     for candidate in (project_root / "mlruns", project_root / "artifacts" / "mlruns"):
         if candidate.exists():
@@ -421,8 +358,6 @@ def _default_mlflow_tracking_uri():
     return (project_root / "mlruns").as_uri()
 
 
-# Reconstruct one metrics dataframe from MLflow metric-history APIs so plotting
-# helpers can work the same way with either CSV logs or MLflow-backed runs.
 def _load_mlflow_metrics_df(
     *,
     experiment_name,
@@ -430,6 +365,7 @@ def _load_mlflow_metrics_df(
     tracking_uri=None,
     metric_names=("epoch", "train_loss", "val_loss", "val_acc"),
 ):
+    """Load epoch-level metric histories for one MLflow run into a merged DataFrame."""
     try:
         import mlflow
     except ImportError as exc:
@@ -458,7 +394,6 @@ def _load_mlflow_metrics_df(
     run_id = runs_df.iloc[0]["run_id"]
     client = mlflow.tracking.MlflowClient()
 
-    # MLflow stores each metric stream separately, so merge them back on `step`.
     metric_frames = []
     for metric_name in metric_names:
         history = client.get_metric_history(run_id, metric_name)
@@ -493,55 +428,27 @@ def _load_mlflow_metrics_df(
     return merged_df
 
 
-# Accept either a preloaded dataframe or an MLflow experiment/run pair and
-# normalize both paths into one metrics dataframe.
-def _resolve_training_metrics_df(
-    df=None,
-    *,
-    experiment_name=None,
-    run_name=None,
-    tracking_uri=None,
-):
-    if df is not None:
-        return df.copy()
-
-    if experiment_name is not None and run_name is not None:
-        return _load_mlflow_metrics_df(
-            experiment_name=experiment_name,
-            run_name=run_name,
-            tracking_uri=tracking_uri,
-        )
-
-    raise ValueError(
-        "Provide either a metrics dataframe or both `experiment_name` and `run_name` for MLflow."
-    )
-
-# Compare Stage 1 and Stage 2 metrics and return a compact summary table.
 def compare_stage_training_runs(
-    stage1_df=None,
-    stage2_df=None,
+    *,
+    stage1_experiment_name,
+    stage2_experiment_name,
+    stage1_run_name,
+    stage2_run_name,
+    tracking_uri=None,
     stage1_name="Stage 1",
     stage2_name="Stage 2",
     one_based_epoch=True,
     print_summary=False,
     plot=False,
     return_details=False,
-    stage1_experiment_name=None,
-    stage2_experiment_name=None,
-    stage1_run_name=None,
-    stage2_run_name=None,
-    tracking_uri=None,
 ):
-    # Allow both direct CSV/dataframe comparisons and MLflow-backed comparisons
-    # so the same helper works during experimentation and report writing.
-    stage1_metrics_df = _resolve_training_metrics_df(
-        stage1_df,
+    """Compare Stage 1 and Stage 2 MLflow runs in a table and optional plots."""
+    stage1_metrics_df = _load_mlflow_metrics_df(
         experiment_name=stage1_experiment_name,
         run_name=stage1_run_name,
         tracking_uri=tracking_uri,
     )
-    stage2_metrics_df = _resolve_training_metrics_df(
-        stage2_df,
+    stage2_metrics_df = _load_mlflow_metrics_df(
         experiment_name=stage2_experiment_name,
         run_name=stage2_run_name,
         tracking_uri=tracking_uri,
@@ -557,13 +464,11 @@ def compare_stage_training_runs(
     )
     epoch_label = "Epoch (1-based)" if one_based_epoch else "Epoch (0-based)"
 
-    # Track both the best validation checkpoint and the final epoch for each stage.
     stage1_best = stage1_history.loc[stage1_history["val_acc"].idxmax()]
     stage2_best = stage2_history.loc[stage2_history["val_acc"].idxmax()]
     stage1_final = stage1_history.iloc[-1]
     stage2_final = stage2_history.iloc[-1]
 
-    # Keep the summary compact so the notebook can render it directly.
     summary_df = pd.DataFrame(
         [
             {
@@ -611,7 +516,6 @@ def compare_stage_training_runs(
         fig, axes = plt.subplots(2, 2, figsize=(16, 10))
         axes = axes.flatten()
 
-        # Panel 1: train loss progression.
         axes[0].plot(
             stage1_history[epoch_col],
             stage1_history["train_loss"],
@@ -649,7 +553,6 @@ def compare_stage_training_runs(
         axes[0].grid(True, linestyle="--", alpha=0.4)
         axes[0].legend()
 
-        # Panel 2: validation loss with best-epoch and final-epoch markers.
         axes[1].plot(
             stage1_history[epoch_col],
             stage1_history["val_loss"],
@@ -703,7 +606,6 @@ def compare_stage_training_runs(
         axes[1].grid(True, linestyle="--", alpha=0.4)
         axes[1].legend()
 
-        # Panel 3: validation accuracy with best-epoch and final-epoch markers.
         axes[2].plot(
             stage1_history[epoch_col],
             stage1_history["val_acc"],
@@ -757,7 +659,6 @@ def compare_stage_training_runs(
         axes[2].grid(True, linestyle="--", alpha=0.4)
         axes[2].legend()
 
-        # Panel 4: compact bar chart of the metrics most likely to be cited later.
         comparison_plot_df = pd.DataFrame(
             {
                 "metric": ["Best Val Acc", "Final Val Acc", "Best Val Loss", "Final Val Loss"],
@@ -802,14 +703,16 @@ def compare_stage_training_runs(
 
     return summary_df
 
-# Check whether a local TCP port is already accepting connections.
+
 def _is_port_open(host, port):
+    """Return whether a TCP port is already accepting connections."""
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
         sock.settimeout(0.5)
         return sock.connect_ex((host, port)) == 0
 
-# Start a local MLflow UI process in the background and print an openable link.
+
 def start_mlflow_ui(tracking_dir=None, host="127.0.0.1", port=5000, timeout=15):
+    """Start a background MLflow UI process if one is not already running."""
     project_root = Path(__file__).resolve().parent.parent
     mlruns_dir = Path(tracking_dir or (project_root / "artifacts" / "mlruns")).resolve()
     mlruns_dir.mkdir(parents=True, exist_ok=True)
@@ -823,8 +726,6 @@ def start_mlflow_ui(tracking_dir=None, host="127.0.0.1", port=5000, timeout=15):
             print(f"Access from: {url}")
         return None
 
-    # Launch MLflow through the current Python interpreter so the notebook uses
-    # the same environment that already has the project dependencies installed.
     command = [
         sys.executable,
         "-m",

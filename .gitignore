@@ -37,6 +37,9 @@ logs/
 outputs/
 
 # Deep learning artifacts
+artifacts/*
+artifacts/checkpoints/*
+artifacts/weights/*
 checkpoints/
 models/
 weights/
@@ -54,6 +57,12 @@ weights/
 *.pkl
 *.npy
 *.npz
+
+# Published release artifacts
+!artifacts/checkpoints/
+!artifacts/weights/
+!artifacts/checkpoints/food101_mobilenetv3_stage2_best.ckpt
+!artifacts/weights/food101_mobilenetv3_stage2_best_state_dict.pth
 
 # Dataset directories
 data/
