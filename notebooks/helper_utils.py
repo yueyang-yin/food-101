@@ -551,6 +551,240 @@ def show_random_validation_predictions(
     return fig, axes
 
 
+def show_test_prediction_examples(
+    model,
+    test_dataset,
+    *,
+    num_correct=2,
+    num_incorrect=2,
+    batch_size=64,
+    num_workers=0,
+    random_seed=None,
+    class_names=None,
+    denormalize_mean=(0.485, 0.456, 0.406),
+    denormalize_std=(0.229, 0.224, 0.225),
+    figsize=None,
+):
+    """Plot random correct and incorrect predictions from a test dataset."""
+    if test_dataset is None:
+        raise ValueError("`test_dataset` cannot be None.")
+
+    # Fail fast with a clear message instead of constructing an empty DataLoader.
+    dataset_size = len(test_dataset)
+    if dataset_size == 0:
+        raise ValueError("Test dataset is empty.")
+
+    # Reuse dataset metadata when the caller does not pass explicit class names.
+    if class_names is None:
+        class_names = _resolve_class_names(test_dataset)
+
+    # Force the model into a safe inference configuration for visualization.
+    model = _require_inference_model(model)
+    was_training = getattr(model, "training", False)
+    model.eval()
+
+    try:
+        # Match the loader output to the device that already holds the model weights.
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+
+    # Store examples separately so the final figure can show one correctness group
+    # per column.
+    correct_examples = []
+    incorrect_examples = []
+
+    # Shuffle deterministically when a seed is provided, but keep DataLoader
+    # shuffling disabled so the sampled order is reproducible.
+    rng = random.Random(random_seed)
+    shuffled_indices = list(range(dataset_size))
+    rng.shuffle(shuffled_indices)
+    sampled_subset = torch.utils.data.Subset(test_dataset, shuffled_indices)
+    loader = torch.utils.data.DataLoader(
+        sampled_subset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+    try:
+        # Disable autograd because this helper only needs forward passes.
+        with torch.inference_mode():
+            for image_batch, true_labels in loader:
+                logits = model(image_batch.to(device))
+                pred_labels = logits.argmax(dim=1).detach().cpu()
+
+                for image_tensor, true_label, pred_label in zip(
+                    image_batch,
+                    true_labels,
+                    pred_labels,
+                ):
+                    example = {
+                        "image_tensor": image_tensor.detach().cpu(),
+                        "true_label": int(true_label),
+                        "pred_label": int(pred_label),
+                    }
+
+                    # Keep collecting examples until each requested bucket is full.
+                    if int(pred_label) == int(true_label):
+                        if len(correct_examples) < num_correct:
+                            correct_examples.append(example)
+                    else:
+                        if len(incorrect_examples) < num_incorrect:
+                            incorrect_examples.append(example)
+
+                    # Stop early as soon as we have enough samples from both groups.
+                    if (
+                        len(correct_examples) >= num_correct
+                        and len(incorrect_examples) >= num_incorrect
+                    ):
+                        break
+
+                if (
+                    len(correct_examples) >= num_correct
+                    and len(incorrect_examples) >= num_incorrect
+                ):
+                    break
+    finally:
+        if was_training:
+            # Restore the original mode so calling this helper does not have
+            # side effects on subsequent training code.
+            model.train()
+
+    # Surface an explicit error when the dataset does not contain enough samples
+    # of either type, instead of silently returning a partial figure.
+    if len(correct_examples) < num_correct:
+        raise ValueError(
+            f"Only found {len(correct_examples)} correct predictions, fewer than "
+            f"the requested {num_correct}."
+        )
+
+    if len(incorrect_examples) < num_incorrect:
+        raise ValueError(
+            f"Only found {len(incorrect_examples)} incorrect predictions, fewer than "
+            f"the requested {num_incorrect}."
+        )
+
+    rows = max(len(correct_examples), len(incorrect_examples))
+    if figsize is None:
+        figsize = (12, rows * 4.5)
+
+    fig, axes = plt.subplots(rows, 2, figsize=figsize, squeeze=False)
+    # Keep the layout consistent: correct samples on the left, mistakes on the right.
+    column_specs = [
+        ("Correct Predictions", correct_examples, "green"),
+        ("Incorrect Predictions", incorrect_examples, "red"),
+    ]
+
+    for col_idx, (group_title, examples, title_color) in enumerate(column_specs):
+        for row_idx in range(rows):
+            axis = axes[row_idx, col_idx]
+
+            if row_idx >= len(examples):
+                axis.axis("off")
+                continue
+
+            example = examples[row_idx]
+            # Undo normalization so matplotlib receives a standard RGB image.
+            display_image = _denormalize_image(
+                example["image_tensor"],
+                denormalize_mean,
+                denormalize_std,
+            ).permute(1, 2, 0)
+
+            axis.imshow(display_image)
+            axis.axis("off")
+            # Color the title to reinforce the correctness grouping at a glance.
+            axis.set_title(
+                (
+                    f"Pred: {class_names[example['pred_label']]}\n"
+                    f"True: {class_names[example['true_label']]}"
+                ),
+                fontsize=11,
+                color=title_color,
+            )
+
+    plt.tight_layout()
+    # Cache the latest figure so notebook code can save it without threading the
+    # figure object through every call site.
+    _remember_figure(fig)
+    plt.show()
+    return fig, axes, {
+        "correct_examples": correct_examples,
+        "incorrect_examples": incorrect_examples,
+    }
+
+
+def show_test_prediction_gradcam_examples(
+    examples,
+    *,
+    class_names,
+    figsize=None,
+):
+    """Plot already-computed Grad-CAM overlays for correct and incorrect samples."""
+    if "correct_examples" not in examples or "incorrect_examples" not in examples:
+        raise ValueError(
+            "`examples` must contain `correct_examples` and `incorrect_examples`."
+        )
+
+    # Copy into lists so callers can pass any iterable-like containers.
+    correct_examples = list(examples["correct_examples"])
+    incorrect_examples = list(examples["incorrect_examples"])
+    rows = max(len(correct_examples), len(incorrect_examples))
+    if rows == 0:
+        raise ValueError("`examples` does not contain any samples to visualize.")
+
+    if figsize is None:
+        figsize = (12, rows * 4.5)
+
+    fig, axes = plt.subplots(rows, 2, figsize=figsize, squeeze=False)
+    # Mirror the plain prediction plot so the user can compare both figures easily.
+    column_specs = [
+        ("Correct Predictions", correct_examples, "green"),
+        ("Incorrect Predictions", incorrect_examples, "red"),
+    ]
+
+    for col_idx, (group_title, grouped_examples, title_color) in enumerate(column_specs):
+        for row_idx in range(rows):
+            axis = axes[row_idx, col_idx]
+            if row_idx >= len(grouped_examples):
+                axis.axis("off")
+                continue
+
+            example = grouped_examples[row_idx]
+            # Validate required metadata here so missing Grad-CAM outputs fail with
+            # a precise error message.
+            if "cam_image" not in example:
+                raise ValueError("Each Grad-CAM example must include a `cam_image` entry.")
+            if "target_label" not in example or "target_label_name" not in example:
+                raise ValueError(
+                    "Each Grad-CAM example must include `target_label` and `target_label_name`."
+                )
+
+            axis.imshow(example["cam_image"])
+            axis.axis("off")
+            title_lines = []
+            # Only add the CAM target line when the heatmap is not already based on
+            # the predicted class, which keeps the common case visually compact.
+            if str(example["target_label_name"]).strip().lower() != "pred":
+                title_lines.append(
+                    f"CAM: {example['target_label_name']} "
+                    f"({class_names[example['target_label']]})"
+                )
+            title_lines.append(f"Pred: {class_names[example['pred_label']]}")
+            title_lines.append(f"True: {class_names[example['true_label']]}")
+            axis.set_title(
+                "\n".join(title_lines),
+                fontsize=11,
+                color=title_color,
+            )
+
+    plt.tight_layout()
+    _remember_figure(fig)
+    plt.show()
+    return fig, axes
+
+
 def save_figure_to_artifacts(
     filename,
     fig=None,
