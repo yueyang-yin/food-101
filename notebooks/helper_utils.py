@@ -86,9 +86,13 @@ def _json_safe_value(value):
     if isinstance(value, torch.Tensor):
         if value.numel() != 1:
             raise ValueError("Only scalar tensors can be serialized as experiment results.")
+        # Convert 0-d / scalar tensors into plain Python numbers before the JSON
+        # dump so experiment caches stay human-readable and portable.
         value = value.item()
 
     if isinstance(value, np.generic):
+        # NumPy scalar dtypes (for example `np.float32`) are not serialized by
+        # the standard library JSON encoder unless we unwrap them first.
         value = value.item()
 
     return value
@@ -113,6 +117,8 @@ def _restore_cached_experiment_results(payload, cases):
         raise ValueError("Cached experiment payload must be a JSON object.")
 
     restored = {}
+    # Normalize the requested cases once up front so we can match them against
+    # JSON object keys, which are always stored as strings on disk.
     normalized_cases = [_restore_case_key(case) for case in cases]
     for case in normalized_cases:
         case_key = str(case)
@@ -133,8 +139,11 @@ def _contains_tensor(item):
     if torch.is_tensor(item):
         return True
     if isinstance(item, dict):
+        # Recursively inspect mapping values because many datasets return
+        # dictionaries like `{"image": tensor, "label": int}`.
         return any(_contains_tensor(value) for value in item.values())
     if isinstance(item, (list, tuple)):
+        # Lists/tuples cover the common `(inputs, targets)` dataset pattern.
         return any(_contains_tensor(value) for value in item)
     return False
 
@@ -160,6 +169,8 @@ def _move_batch_to_device(batch, device):
     if torch.is_tensor(batch):
         return batch.to(device)
     if isinstance(batch, dict):
+        # Preserve the original container shape so downstream code sees the same
+        # batch structure after the device transfer.
         return {key: _move_batch_to_device(value, device) for key, value in batch.items()}
     if isinstance(batch, list):
         return [_move_batch_to_device(value, device) for value in batch]
@@ -1051,6 +1062,8 @@ def _measure_loader_efficiency(
     loader = _prepare_loader_for_iteration(loader)
     loader_iter = iter(loader)
 
+    # Separate "idle" time (waiting for the next batch to be produced) from
+    # "active" time (moving the finished batch onto the target device).
     active_times = []
     idle_times = []
     total_steps = num_warmup_batches + num_batches
@@ -1061,16 +1074,22 @@ def _measure_loader_efficiency(
             try:
                 batch = next(loader_iter)
             except StopIteration:
+                # Short datasets are still valid; just measure however many
+                # batches we were able to observe before exhaustion.
                 break
             idle_seconds = time.perf_counter() - idle_start
 
             active_start = time.perf_counter()
             batch = _move_batch_to_device(batch, device)
+            # Device copies can be asynchronous on accelerators, so synchronize
+            # before stopping the timer to avoid under-reporting active time.
             _synchronize_device(device)
             active_seconds = time.perf_counter() - active_start
             del batch
 
             if step_idx >= num_warmup_batches:
+                # Ignore warm-up iterations so cache fills / worker spin-up do
+                # not skew the steady-state percentages.
                 idle_times.append(idle_seconds)
                 active_times.append(active_seconds)
 
@@ -1190,6 +1209,8 @@ def _measure_average_epoch_time_impl(loader, device, num_epochs=5, num_warmup_ep
     epoch_times = []
 
     for epoch_idx, progress_bar in _iter_epoch_progress(num_epochs):
+        # Synchronize both before and after the loop so each epoch includes the
+        # full cost of outstanding accelerator work and host-to-device copies.
         _synchronize_device(device)
         start_time = time.perf_counter()
 
@@ -1207,6 +1228,8 @@ def _measure_average_epoch_time_impl(loader, device, num_epochs=5, num_warmup_ep
             epoch_message += " (warm-up)"
         _write_progress_line(progress_bar, epoch_message)
 
+    # Drop the warm-up epochs from the reported average so notebook comparisons
+    # focus on the stabilized throughput of each loader configuration.
     measured_times = epoch_times[num_warmup_epochs:]
     average_time = sum(measured_times) / len(measured_times)
     print()
@@ -1234,6 +1257,8 @@ def _run_experiment_impl(
     relative_checkpoint_path = _display_relative_path(checkpoint_path)
 
     if checkpoint_path.exists() and not rerun:
+        # Fast path: reuse the on-disk cache when the caller did not explicitly
+        # request a fresh run of the experiment.
         print(
             f"Results for experiment '{experiment_name}' found. "
             f"Loading from {relative_checkpoint_path}"
@@ -1252,6 +1277,8 @@ def _run_experiment_impl(
     print(f"Executing experiment '{experiment_name}'...")
     experiment_results = experiment_fcn(cases, **experiment_kwargs)
 
+    # Stringify keys on write because JSON object keys must be strings, while
+    # notebook experiments often use ints / floats / NumPy scalars as cases.
     serializable_results = {
         str(_restore_case_key(case)): _json_safe_value(value)
         for case, value in experiment_results.items()
