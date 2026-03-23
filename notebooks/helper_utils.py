@@ -1,7 +1,16 @@
-"""Helper utilities used by the Food-101 notebooks."""
+"""Helper utilities used by the Food-101 notebooks.
+
+The file is organized to match notebook usage order:
+1. Shared helpers used by both notebooks.
+2. Public helpers consumed by `01_baseline_and_transfer_learning.ipynb`.
+3. Public helpers consumed by `02_analysis_and_optimization.ipynb`.
+4. Lower-level private implementations and MLflow internals.
+"""
 
 from collections import Counter
+import json
 import math
+import os
 from pathlib import Path
 import random
 import socket
@@ -10,8 +19,14 @@ import sys
 import time
 
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import torch
+
+try:
+    from tqdm.auto import tqdm
+except Exception:
+    tqdm = None
 
 try:
     from IPython.display import HTML, display
@@ -22,11 +37,174 @@ except Exception:
     display = None
 
 
+if (
+    hasattr(torch, "mps")
+    and hasattr(torch.mps, "empty_cache")
+    and hasattr(torch, "backends")
+    and hasattr(torch.backends, "mps")
+    and not hasattr(torch.backends.mps, "empty_cache")
+):
+    # The notebook currently calls `torch.backends.mps.empty_cache()`, while
+    # PyTorch exposes the cache helper on `torch.mps.empty_cache()`. Mirror the
+    # public helper here so the notebook cells can keep their current code.
+    torch.backends.mps.empty_cache = torch.mps.empty_cache
+
+
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
 # Cache the most recently shown figure so notebook users can call the save helper
 # in a later cell without manually threading `fig` around.
 _LAST_RENDERED_FIGURE = None
 
+
+# ---------------------------------------------------------------------------
+# Shared path, serialization, and runtime helpers
+# ---------------------------------------------------------------------------
+
+def _notebook_dir():
+    """Return the directory that contains the project notebooks and helpers."""
+    return Path(__file__).resolve().parent
+
+
+def _project_root():
+    """Return the repository root used by the notebook helpers."""
+    return _notebook_dir().parent
+
+
+def _experiment_checkpoint_dir():
+    """Return the folder where notebook experiments cache their results."""
+    return _project_root() / "artifacts" / "checkpoint_experiments"
+
+
+def _display_relative_path(path, start=None):
+    """Return a stable relative path string for notebook-facing status messages."""
+    start = Path(start or _notebook_dir())
+    return Path(os.path.relpath(path, start=start)).as_posix()
+
+
+def _json_safe_value(value):
+    """Convert notebook result values into JSON-serializable primitives."""
+    if isinstance(value, torch.Tensor):
+        if value.numel() != 1:
+            raise ValueError("Only scalar tensors can be serialized as experiment results.")
+        value = value.item()
+
+    if isinstance(value, np.generic):
+        value = value.item()
+
+    return value
+
+
+def _restore_case_key(case):
+    """Normalize JSON-loaded case keys back to the original case type."""
+    if isinstance(case, torch.Tensor):
+        if case.numel() != 1:
+            raise ValueError("Experiment cases must be scalar values.")
+        return case.item()
+
+    if isinstance(case, np.generic):
+        return case.item()
+
+    return case
+
+
+def _restore_cached_experiment_results(payload, cases):
+    """Map cached JSON keys back to the same key types passed in via `cases`."""
+    if not isinstance(payload, dict):
+        raise ValueError("Cached experiment payload must be a JSON object.")
+
+    restored = {}
+    normalized_cases = [_restore_case_key(case) for case in cases]
+    for case in normalized_cases:
+        case_key = str(case)
+        if case_key in payload:
+            restored[case] = _json_safe_value(payload[case_key])
+
+    # Preserve any extra keys the caller did not explicitly request so cached
+    # results remain inspectable if the case list changes later.
+    for key, value in payload.items():
+        if key not in {str(case) for case in normalized_cases}:
+            restored[key] = _json_safe_value(value)
+
+    return restored
+
+
+def _contains_tensor(item):
+    """Return whether one nested sample structure contains at least one tensor."""
+    if torch.is_tensor(item):
+        return True
+    if isinstance(item, dict):
+        return any(_contains_tensor(value) for value in item.values())
+    if isinstance(item, (list, tuple)):
+        return any(_contains_tensor(value) for value in item)
+    return False
+
+
+def _prepare_loader_for_iteration(loader):
+    """Validate that the DataLoader yields tensors produced by a transform pipeline."""
+    dataset = getattr(loader, "dataset", None)
+    if dataset is None or len(dataset) == 0:
+        return loader
+
+    sample = dataset[0]
+    if not _contains_tensor(sample):
+        raise TypeError(
+            "The benchmark helpers expect the dataset to return tensors. "
+            "Pass the same transform pipeline used in training so the DataLoader "
+            "yields tensor batches instead of raw PIL images."
+        )
+    return loader
+
+
+def _move_batch_to_device(batch, device):
+    """Recursively move tensor batches to the requested device for fair timing."""
+    if torch.is_tensor(batch):
+        return batch.to(device)
+    if isinstance(batch, dict):
+        return {key: _move_batch_to_device(value, device) for key, value in batch.items()}
+    if isinstance(batch, list):
+        return [_move_batch_to_device(value, device) for value in batch]
+    if isinstance(batch, tuple):
+        return tuple(_move_batch_to_device(value, device) for value in batch)
+    return batch
+
+
+def _synchronize_device(device):
+    """Wait for asynchronous accelerator work to finish before stopping a timer."""
+    device = torch.device(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        torch.cuda.synchronize(device)
+    elif device.type == "mps" and hasattr(torch, "mps") and hasattr(torch.mps, "synchronize"):
+        # `torch.mps.synchronize()` is guarded because some PyTorch builds expose
+        # MPS availability checks without the synchronization helper.
+        torch.mps.synchronize()
+
+
+def _iter_epoch_progress(num_epochs):
+    """Yield epoch indices with a tqdm progress bar when tqdm is available."""
+    if tqdm is None:
+        for epoch_idx in range(1, num_epochs + 1):
+            yield epoch_idx, None
+        return
+
+    progress_bar = tqdm(range(1, num_epochs + 1), desc="Overall Progress", total=num_epochs)
+    try:
+        for epoch_idx in progress_bar:
+            yield epoch_idx, progress_bar
+    finally:
+        progress_bar.close()
+
+
+def _write_progress_line(progress_bar, message):
+    """Print epoch timing lines without corrupting the tqdm bar."""
+    if progress_bar is not None:
+        progress_bar.write(message)
+    else:
+        print(message)
+
+
+# ---------------------------------------------------------------------------
+# Notebook 01 helpers: dataset inspection
+# ---------------------------------------------------------------------------
 
 def _resolve_dataset_root(data_dir):
     """Return the Food-101 dataset root from either the root itself or its parent."""
@@ -172,6 +350,22 @@ def display_random_images(data_dir, num_classes=3, images_per_class=2, random_se
     plt.show()
 
 
+# ---------------------------------------------------------------------------
+# Notebook 01 helpers: MLflow, prediction inspection, and report figures
+# ---------------------------------------------------------------------------
+
+def start_mlflow_ui(tracking_dir=None, host="127.0.0.1", port=5000, timeout=15):
+    """Start the MLflow UI used in notebook 01, reusing the shared implementation below."""
+    return _start_mlflow_ui_impl(
+        tracking_dir=tracking_dir,
+        host=host,
+        port=port,
+        timeout=timeout,
+    )
+
+
+# Internal visualization helpers for notebook 01 live below the public MLflow
+# wrapper so the notebook-facing API remains grouped in reading order.
 def _unwrap_dataset(dataset):
     """Peel nested dataset wrappers until the base dataset is reached."""
     # `Subset` and other wrapper datasets typically expose the wrapped dataset on
@@ -389,6 +583,455 @@ def save_figure_to_artifacts(
     return save_path
 
 
+def compare_stage_training_runs(
+    *,
+    stage1_experiment_name,
+    stage2_experiment_name,
+    stage1_run_name,
+    stage2_run_name,
+    tracking_uri=None,
+    stage1_name="Stage 1",
+    stage2_name="Stage 2",
+    one_based_epoch=True,
+    print_summary=False,
+    plot=False,
+    return_details=False,
+):
+    """Compare notebook 01 stage-training runs using the shared MLflow implementation."""
+    return _compare_stage_training_runs_impl(
+        stage1_experiment_name=stage1_experiment_name,
+        stage2_experiment_name=stage2_experiment_name,
+        stage1_run_name=stage1_run_name,
+        stage2_run_name=stage2_run_name,
+        tracking_uri=tracking_uri,
+        stage1_name=stage1_name,
+        stage2_name=stage2_name,
+        one_based_epoch=one_based_epoch,
+        print_summary=print_summary,
+        plot=plot,
+        return_details=return_details,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Notebook 02 helpers: DataLoader benchmarking and efficiency analysis
+# ---------------------------------------------------------------------------
+
+def measure_average_epoch_time(loader, device, num_epochs=5, num_warmup_epochs=2):
+    """Measure the average iteration time of one DataLoader configuration across epochs."""
+    return _measure_average_epoch_time_impl(
+        loader,
+        device,
+        num_epochs=num_epochs,
+        num_warmup_epochs=num_warmup_epochs,
+    )
+
+
+def run_experiment(
+    *,
+    experiment_name,
+    experiment_fcn,
+    cases,
+    rerun=False,
+    checkpoint_dir=None,
+    **experiment_kwargs,
+):
+    """Run one cached notebook experiment and return the ordered case-to-result mapping."""
+    return _run_experiment_impl(
+        experiment_name=experiment_name,
+        experiment_fcn=experiment_fcn,
+        cases=cases,
+        rerun=rerun,
+        checkpoint_dir=checkpoint_dir,
+        **experiment_kwargs,
+    )
+
+
+def plot_performance_summary(
+    performance_by_case,
+    title="Performance Summary",
+    xlabel="Case",
+    ylabel="Average Time per Epoch (milliseconds)",
+    *,
+    convert_to_milliseconds=True,
+    figsize=(12, 6),
+    line_color="#2b8ead",
+    marker="o",
+    linestyle="--",
+    linewidth=2.5,
+    markersize=9,
+    annotation_decimals=2,
+):
+    """Plot one minimalist performance curve for any ordered set of benchmark cases."""
+    return _plot_performance_summary_impl(
+        performance_by_case,
+        title=title,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        convert_to_milliseconds=convert_to_milliseconds,
+        figsize=figsize,
+        line_color=line_color,
+        marker=marker,
+        linestyle=linestyle,
+        linewidth=linewidth,
+        markersize=markersize,
+        annotation_decimals=annotation_decimals,
+    )
+
+
+def visualize_dataloader_efficiency(
+    loaders_to_compare,
+    device,
+    *,
+    num_batches=30,
+    num_warmup_batches=5,
+    title="DataLoader Performance Comparison (Efficiency)",
+    xlabel="DataLoader Configuration",
+    ylabel="Percentage of Average Time per Batch (%)",
+    active_label="GPU Active Time",
+    idle_label="GPU Idle / Waiting Time",
+    active_color="#2563A6",
+    idle_color="#D9E8F5",
+    edge_color="#D0DCE8",
+    figsize=(12, 8),
+):
+    """Plot the active-vs-idle batch-time split using a minimalist blue stacked bar chart."""
+    return _visualize_dataloader_efficiency_impl(
+        loaders_to_compare,
+        device,
+        num_batches=num_batches,
+        num_warmup_batches=num_warmup_batches,
+        title=title,
+        xlabel=xlabel,
+        ylabel=ylabel,
+        active_label=active_label,
+        idle_label=idle_label,
+        active_color=active_color,
+        idle_color=idle_color,
+        edge_color=edge_color,
+        figsize=figsize,
+    )
+
+
+def _plot_performance_summary_impl(
+    performance_by_case,
+    title="Performance Summary",
+    xlabel="Case",
+    ylabel="Average Time per Epoch (milliseconds)",
+    *,
+    convert_to_milliseconds=True,
+    figsize=(12, 6),
+    line_color="#2b8ead",
+    marker="o",
+    linestyle="--",
+    linewidth=2.5,
+    markersize=9,
+    annotation_decimals=2,
+):
+    """Implementation for plotting one performance curve with value labels above each point."""
+    if not performance_by_case:
+        raise ValueError("`performance_by_case` cannot be empty.")
+
+    ordered_items = [
+        (_restore_case_key(case), value) for case, value in performance_by_case.items()
+    ]
+
+    x_labels = []
+    y_values = []
+    invalid_cases = []
+
+    for case, value in ordered_items:
+        value = _json_safe_value(value)
+        if value is None or not np.isfinite(value):
+            invalid_cases.append(case)
+            continue
+
+        x_labels.append(str(case))
+        y_values.append(float(value) * 1000.0 if convert_to_milliseconds else float(value))
+
+    if not x_labels:
+        raise ValueError("No finite values are available to plot.")
+
+    x_positions = np.arange(len(x_labels))
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.plot(
+        x_positions,
+        y_values,
+        color=line_color,
+        marker=marker,
+        linestyle=linestyle,
+        linewidth=linewidth,
+        markersize=markersize,
+    )
+
+    ax.set_title(title, fontsize=20, pad=14)
+    ax.set_xlabel(xlabel, fontsize=14)
+    ax.set_ylabel(ylabel, fontsize=14)
+    ax.grid(True, linestyle="-", linewidth=1, alpha=0.45)
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(x_labels)
+
+    y_min = min(y_values)
+    y_max = max(y_values)
+    y_span = max(y_max - y_min, y_max * 0.08, 1.0)
+    annotation_offset = y_span * 0.06
+    ax.set_ylim(bottom=0, top=y_max + annotation_offset * 2.0)
+
+    for x_position, y_value in zip(x_positions, y_values):
+        ax.annotate(
+            f"{y_value:.{annotation_decimals}f}",
+            xy=(x_position, y_value),
+            xytext=(0, 14),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=13,
+            color=line_color,
+        )
+
+    if invalid_cases:
+        print(
+            "Skipped non-finite values for cases: "
+            + ", ".join(str(case) for case in invalid_cases)
+        )
+
+    plt.tight_layout()
+    _remember_figure(fig)
+    plt.show()
+    return fig, ax
+
+
+def _measure_loader_efficiency(
+    loader,
+    device,
+    *,
+    num_batches=30,
+    num_warmup_batches=5,
+):
+    """Estimate active vs. waiting time percentages for one DataLoader."""
+    if num_batches <= 0:
+        raise ValueError("`num_batches` must be a positive integer.")
+    if num_warmup_batches < 0:
+        raise ValueError("`num_warmup_batches` cannot be negative.")
+
+    loader = _prepare_loader_for_iteration(loader)
+    loader_iter = iter(loader)
+
+    active_times = []
+    idle_times = []
+    total_steps = num_warmup_batches + num_batches
+
+    with torch.inference_mode():
+        for step_idx in range(total_steps):
+            idle_start = time.perf_counter()
+            try:
+                batch = next(loader_iter)
+            except StopIteration:
+                break
+            idle_seconds = time.perf_counter() - idle_start
+
+            active_start = time.perf_counter()
+            batch = _move_batch_to_device(batch, device)
+            _synchronize_device(device)
+            active_seconds = time.perf_counter() - active_start
+            del batch
+
+            if step_idx >= num_warmup_batches:
+                idle_times.append(idle_seconds)
+                active_times.append(active_seconds)
+
+    if not active_times:
+        raise ValueError("Not enough batches were available to measure DataLoader efficiency.")
+
+    total_active = sum(active_times)
+    total_idle = sum(idle_times)
+    total_time = total_active + total_idle
+    active_pct = (total_active / total_time) * 100.0 if total_time > 0 else 0.0
+    idle_pct = 100.0 - active_pct
+
+    return {
+        "active_pct": active_pct,
+        "idle_pct": idle_pct,
+        "avg_active_ms": (total_active / len(active_times)) * 1000.0,
+        "avg_idle_ms": (total_idle / len(idle_times)) * 1000.0,
+        "measured_batches": len(active_times),
+    }
+
+# Private implementations for the notebook 02 public wrappers above.
+def _visualize_dataloader_efficiency_impl(
+    loaders_to_compare,
+    device,
+    *,
+    num_batches=30,
+    num_warmup_batches=5,
+    title="DataLoader Performance Comparison (Efficiency)",
+    xlabel="DataLoader Configuration",
+    ylabel="Percentage of Average Time per Batch (%)",
+    active_label="GPU Active Time",
+    idle_label="GPU Idle / Waiting Time",
+    active_color="#2563A6",
+    idle_color="#D9E8F5",
+    edge_color="#D0DCE8",
+    figsize=(12, 8),
+):
+    """Implementation for the stacked-bar DataLoader efficiency visualization."""
+    if not loaders_to_compare:
+        raise ValueError("`loaders_to_compare` cannot be empty.")
+
+    summary_rows = []
+    for loader_name, loader in loaders_to_compare.items():
+        metrics = _measure_loader_efficiency(
+            loader,
+            device,
+            num_batches=num_batches,
+            num_warmup_batches=num_warmup_batches,
+        )
+        summary_rows.append(
+            {
+                "label": str(loader_name),
+                **metrics,
+            }
+        )
+
+    summary_df = pd.DataFrame(summary_rows)
+
+    fig, ax = plt.subplots(figsize=figsize)
+    x_positions = np.arange(len(summary_df))
+
+    active_bars = ax.bar(
+        x_positions,
+        summary_df["active_pct"],
+        color=active_color,
+        width=0.8,
+        label=active_label,
+    )
+    idle_bars = ax.bar(
+        x_positions,
+        summary_df["idle_pct"],
+        bottom=summary_df["active_pct"],
+        color=idle_color,
+        edgecolor=edge_color,
+        linewidth=1.0,
+        width=0.8,
+        label=idle_label,
+    )
+
+    ax.set_title(title, fontsize=22, pad=16, weight="semibold")
+    ax.set_xlabel(xlabel, fontsize=14)
+    ax.set_ylabel(ylabel, fontsize=14)
+    ax.set_ylim(0, 100)
+    ax.set_xticks(x_positions)
+    ax.set_xticklabels(summary_df["label"], rotation=45, ha="right")
+    ax.grid(True, axis="y", linestyle="--", linewidth=1, alpha=0.35)
+    ax.set_axisbelow(True)
+    ax.legend(frameon=False)
+
+    for bar, active_pct in zip(active_bars, summary_df["active_pct"]):
+        ax.annotate(
+            f"{active_pct:.1f}%",
+            xy=(bar.get_x() + bar.get_width() / 2.0, active_pct),
+            xytext=(0, 8),
+            textcoords="offset points",
+            ha="center",
+            va="bottom",
+            fontsize=16,
+            fontweight="semibold",
+            color=active_color,
+        )
+
+    plt.tight_layout()
+    _remember_figure(fig)
+    plt.show()
+    return summary_df, fig, ax
+
+
+def _measure_average_epoch_time_impl(loader, device, num_epochs=5, num_warmup_epochs=2):
+    """Implementation for measuring one DataLoader configuration across several epochs."""
+    if num_epochs <= 0:
+        raise ValueError("`num_epochs` must be a positive integer.")
+    if num_warmup_epochs < 0 or num_warmup_epochs >= num_epochs:
+        raise ValueError("`num_warmup_epochs` must be between 0 and `num_epochs - 1`.")
+
+    loader = _prepare_loader_for_iteration(loader)
+    epoch_times = []
+
+    for epoch_idx, progress_bar in _iter_epoch_progress(num_epochs):
+        _synchronize_device(device)
+        start_time = time.perf_counter()
+
+        with torch.inference_mode():
+            for batch in loader:
+                batch = _move_batch_to_device(batch, device)
+                del batch
+
+        _synchronize_device(device)
+        elapsed_seconds = time.perf_counter() - start_time
+        epoch_times.append(elapsed_seconds)
+
+        epoch_message = f"Epoch {epoch_idx}/{num_epochs} | Time: {elapsed_seconds:.2f} seconds"
+        if epoch_idx <= num_warmup_epochs:
+            epoch_message += " (warm-up)"
+        _write_progress_line(progress_bar, epoch_message)
+
+    measured_times = epoch_times[num_warmup_epochs:]
+    average_time = sum(measured_times) / len(measured_times)
+    print()
+    print(
+        f"Average execution time (avg of last {len(measured_times)}): "
+        f"{average_time:.2f} seconds"
+    )
+    print()
+    return average_time
+
+
+def _run_experiment_impl(
+    *,
+    experiment_name,
+    experiment_fcn,
+    cases,
+    rerun=False,
+    checkpoint_dir=None,
+    **experiment_kwargs,
+):
+    """Implementation for running, caching, and restoring notebook experiment results."""
+    checkpoint_dir = Path(checkpoint_dir or _experiment_checkpoint_dir())
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path = checkpoint_dir / f"{experiment_name}.json"
+    relative_checkpoint_path = _display_relative_path(checkpoint_path)
+
+    if checkpoint_path.exists() and not rerun:
+        print(
+            f"Results for experiment '{experiment_name}' found. "
+            f"Loading from {relative_checkpoint_path}"
+        )
+        cached_results = json.loads(checkpoint_path.read_text())
+        return _restore_cached_experiment_results(cached_results, cases)
+
+    if checkpoint_path.exists() and rerun:
+        print(
+            f"Results for experiment '{experiment_name}' already exist, "
+            "but `rerun=True`, so the cache will be overwritten."
+        )
+    else:
+        print(f"Results for experiment '{experiment_name}' not found. Running experiment.")
+
+    print(f"Executing experiment '{experiment_name}'...")
+    experiment_results = experiment_fcn(cases, **experiment_kwargs)
+
+    serializable_results = {
+        str(_restore_case_key(case)): _json_safe_value(value)
+        for case, value in experiment_results.items()
+    }
+    checkpoint_path.write_text(json.dumps(serializable_results, indent=2, allow_nan=True))
+
+    print(f"Results for experiment '{experiment_name}' saved to {relative_checkpoint_path}")
+    return experiment_results
+
+
+# ---------------------------------------------------------------------------
+# Notebook 01 private MLflow implementations
+# ---------------------------------------------------------------------------
+
 def _build_epoch_history(df, one_based_epoch=True):
     """Collapse MLflow metric rows into one row per completed epoch."""
     history = (
@@ -508,7 +1151,7 @@ def _load_mlflow_metrics_df(
     return merged_df
 
 
-def compare_stage_training_runs(
+def _compare_stage_training_runs_impl(
     *,
     stage1_experiment_name,
     stage2_experiment_name,
@@ -522,7 +1165,7 @@ def compare_stage_training_runs(
     plot=False,
     return_details=False,
 ):
-    """Compare Stage 1 and Stage 2 MLflow runs in a table and optional plots."""
+    """Implementation for comparing Stage 1 and Stage 2 MLflow runs."""
     # Load both runs through the same normalization path so the comparison table
     # can be built from aligned epoch-level histories.
     stage1_metrics_df = _load_mlflow_metrics_df(
@@ -812,8 +1455,8 @@ def _is_port_open(host, port):
         return sock.connect_ex((host, port)) == 0
 
 
-def start_mlflow_ui(tracking_dir=None, host="127.0.0.1", port=5000, timeout=15):
-    """Start a background MLflow UI process if one is not already running."""
+def _start_mlflow_ui_impl(tracking_dir=None, host="127.0.0.1", port=5000, timeout=15):
+    """Implementation for starting a background MLflow UI process."""
     project_root = Path(__file__).resolve().parent.parent
     # Default to the project's artifact-backed MLflow store when callers do not
     # specify a directory explicitly.
