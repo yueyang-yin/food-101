@@ -7,7 +7,9 @@ The file is organized to match notebook usage order:
 4. Lower-level private implementations and MLflow internals.
 """
 
+import copy
 from collections import Counter
+import io
 import json
 import math
 import os
@@ -796,6 +798,117 @@ def show_test_prediction_gradcam_examples(
     return fig, axes
 
 
+def _load_food101_class_names_from_metadata():
+    """Best-effort fallback for Food-101 class names when no dataset is passed in."""
+    classes_path = _project_root() / "data" / "food-101" / "meta" / "classes.txt"
+    if not classes_path.exists():
+        return None
+
+    class_names = [line.strip() for line in classes_path.read_text().splitlines() if line.strip()]
+    return class_names or None
+
+
+def show_prediction_grid(
+    input_data,
+    true_labels,
+    predictions,
+    *,
+    class_names=None,
+    denormalize_mean=(0.485, 0.456, 0.406),
+    denormalize_std=(0.229, 0.224, 0.225),
+    max_cols=4,
+    figsize=None,
+):
+    """Plot ONNX prediction results for a batch of normalized image tensors."""
+    input_array = np.asarray(input_data)
+    true_labels = np.asarray(true_labels)
+    predictions = np.asarray(predictions)
+
+    if input_array.ndim != 4:
+        raise ValueError(
+            "`input_data` must have shape `(batch, channels, height, width)`."
+        )
+
+    num_images = input_array.shape[0]
+    if num_images == 0:
+        raise ValueError("`input_data` does not contain any images to display.")
+
+    if len(true_labels) != num_images:
+        raise ValueError(
+            "`true_labels` must have the same length as the batch dimension in `input_data`."
+        )
+
+    if predictions.ndim == 2:
+        if predictions.shape[0] != num_images:
+            raise ValueError(
+                "When `predictions` contains logits, its batch dimension must match `input_data`."
+            )
+        pred_labels = predictions.argmax(axis=1)
+        num_classes = predictions.shape[1]
+    elif predictions.ndim == 1:
+        if predictions.shape[0] != num_images:
+            raise ValueError(
+                "When `predictions` contains label ids, its length must match `input_data`."
+            )
+        pred_labels = predictions.astype(int)
+        num_classes = int(max(np.max(pred_labels), np.max(true_labels)) + 1)
+    else:
+        raise ValueError(
+            "`predictions` must either be a 1D array of label ids or a 2D array of logits."
+        )
+
+    if class_names is None:
+        class_names = _load_food101_class_names_from_metadata()
+    if class_names is None:
+        class_names = [f"Class {idx}" for idx in range(num_classes)]
+    else:
+        class_names = list(class_names)
+
+    if len(class_names) < num_classes:
+        raise ValueError(
+            f"`class_names` only contains {len(class_names)} entries, but at least "
+            f"{num_classes} are required."
+        )
+
+    rows = math.ceil(num_images / max_cols)
+    cols = min(num_images, max_cols)
+    if figsize is None:
+        figsize = (cols * 4.5, rows * 4.5)
+
+    fig, axes = plt.subplots(rows, cols, figsize=figsize, squeeze=False)
+    flat_axes = axes.flatten()
+
+    for axis, image_array, true_label, pred_label in zip(
+        flat_axes,
+        input_array,
+        true_labels,
+        pred_labels,
+    ):
+        image_tensor = torch.as_tensor(image_array).detach().cpu()
+        display_image = _denormalize_image(
+            image_tensor,
+            denormalize_mean,
+            denormalize_std,
+        ).permute(1, 2, 0)
+
+        axis.imshow(display_image)
+        axis.axis("off")
+        is_correct = int(pred_label) == int(true_label)
+        axis.set_title(
+            f"Pred: {class_names[int(pred_label)]}\nTrue: {class_names[int(true_label)]}",
+            fontsize=11,
+            color="green" if is_correct else "red",
+        )
+
+    for axis in flat_axes[num_images:]:
+        axis.axis("off")
+
+    plt.tight_layout()
+    _remember_figure(fig)
+    plt.show()
+    return fig, axes
+
+
 def save_figure_to_artifacts(
     filename,
     fig=None,
@@ -861,6 +974,70 @@ def compare_stage_training_runs(
 # ---------------------------------------------------------------------------
 # Notebook 02 helpers: DataLoader benchmarking and efficiency analysis
 # ---------------------------------------------------------------------------
+
+def compute_accuracy(model, loader, device):
+    """Compute classification accuracy for one model over one evaluation DataLoader."""
+    return _compute_accuracy_impl(model, loader, device)
+
+
+def sparsity_report(model):
+    """Summarize weight sparsity across the prunable layers of one model."""
+    return _sparsity_report_impl(model)
+
+
+def bench(
+    model,
+    device,
+    *,
+    batch_size=32,
+    image_size=224,
+    num_warmup=10,
+    num_iterations=50,
+):
+    """Benchmark average forward time per synthetic image batch."""
+    return _bench_impl(
+        model,
+        device,
+        batch_size=batch_size,
+        image_size=image_size,
+        num_warmup=num_warmup,
+        num_iterations=num_iterations,
+    )
+
+
+def prune_mobilenetv3_classifier(
+    model,
+    hidden_dim,
+):
+    """Physically shrink the MobileNetV3-Large classifier hidden width."""
+    return _prune_mobilenetv3_classifier_impl(model, hidden_dim)
+
+
+def select_latency_constrained_mobilenetv3_pruning(
+    model,
+    loader,
+    device,
+    *,
+    min_accuracy=0.81,
+    candidate_hidden_dims=(1216, 1152, 1088, 1024),
+    batch_size=32,
+    image_size=224,
+    num_warmup=10,
+    num_iterations=50,
+):
+    """Search classifier-width pruning candidates and keep the fastest valid one."""
+    return _select_latency_constrained_mobilenetv3_pruning_impl(
+        model,
+        loader,
+        device,
+        min_accuracy=min_accuracy,
+        candidate_hidden_dims=candidate_hidden_dims,
+        batch_size=batch_size,
+        image_size=image_size,
+        num_warmup=num_warmup,
+        num_iterations=num_iterations,
+    )
+
 
 def measure_average_epoch_time(loader, device, num_epochs=5, num_warmup_epochs=2):
     """Measure the average iteration time of one DataLoader configuration across epochs."""
@@ -958,6 +1135,38 @@ def visualize_dataloader_efficiency(
     )
 
 
+def get_model_size_mb(model):
+    """Estimate one model's serialized state_dict size in megabytes."""
+    return _get_model_size_mb_impl(model)
+
+
+def build_quantization_comparison_df(
+    fp32_model,
+    quantized_model,
+    *,
+    fp32_acc,
+    quant_acc,
+    fp32_time_s,
+    quant_time_s,
+    quantized_label="Quantized Model (Dynamic)",
+):
+    """Build a comparison table for baseline vs. quantized model size, latency, and accuracy."""
+    return _build_quantization_comparison_df_impl(
+        fp32_model,
+        quantized_model,
+        fp32_acc=fp32_acc,
+        quant_acc=quant_acc,
+        fp32_time_s=fp32_time_s,
+        quant_time_s=quant_time_s,
+        quantized_label=quantized_label,
+    )
+
+
+def build_model_comparison_df(model_specs):
+    """Build a comparison table for an arbitrary list of evaluated models."""
+    return _build_model_comparison_df_impl(model_specs)
+
+
 def _plot_performance_summary_impl(
     performance_by_case,
     title="Performance Summary",
@@ -1044,6 +1253,501 @@ def _plot_performance_summary_impl(
     _remember_figure(fig)
     plt.show()
     return fig, ax
+
+
+def _get_model_size_mb_impl(model):
+    """Implementation for estimating serialized state_dict size in megabytes."""
+    model = _require_inference_model(model)
+    buffer = io.BytesIO()
+    try:
+        torch.save(model.state_dict(), buffer)
+        return buffer.getbuffer().nbytes / (1024 ** 2)
+    finally:
+        buffer.close()
+
+
+def _build_quantization_comparison_df_impl(
+    fp32_model,
+    quantized_model,
+    *,
+    fp32_acc,
+    quant_acc,
+    fp32_time_s,
+    quant_time_s,
+    quantized_label="Quantized Model (Dynamic)",
+):
+    """Implementation for comparing baseline and quantized models in one DataFrame."""
+    fp32_size_mb = _get_model_size_mb_impl(fp32_model)
+    quant_size_mb = _get_model_size_mb_impl(quantized_model)
+
+    return pd.DataFrame(
+        {
+            "Baseline Model": [
+                fp32_size_mb,
+                fp32_time_s * 1e3,
+                fp32_acc * 100,
+            ],
+            quantized_label: [
+                quant_size_mb,
+                quant_time_s * 1e3,
+                quant_acc * 100,
+            ],
+            "Change": [
+                fp32_size_mb - quant_size_mb,
+                (fp32_time_s - quant_time_s) * 1e3,
+                (quant_acc - fp32_acc) * 100,
+            ],
+        },
+        index=[
+            "Model Size (MB)",
+            "Inference Latency (ms)",
+            "Accuracy (pp)",
+        ],
+    )
+
+
+def _build_model_comparison_df_impl(model_specs):
+    """Implementation for building a multi-model comparison DataFrame."""
+    if not model_specs:
+        raise ValueError("`model_specs` cannot be empty.")
+
+    column_data = {}
+    for spec in model_specs:
+        label = spec.get("label")
+        model = spec.get("model")
+        accuracy = spec.get("accuracy")
+        latency_s = spec.get("latency_s")
+
+        if label is None or model is None or accuracy is None or latency_s is None:
+            raise ValueError(
+                "Each model spec must provide `label`, `model`, `accuracy`, and `latency_s`."
+            )
+
+        column_data[str(label)] = [
+            _get_model_size_mb_impl(model),
+            float(latency_s) * 1e3,
+            float(accuracy) * 100,
+        ]
+
+    return pd.DataFrame(
+        column_data,
+        index=[
+            "Model Size (MB)",
+            "Inference Latency (ms)",
+            "Accuracy (%)",
+        ],
+    )
+
+
+def _extract_inputs_and_targets(batch):
+    """Normalize common batch structures into an `(inputs, targets)` pair."""
+    if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+        return batch[0], batch[1]
+
+    if isinstance(batch, dict):
+        for input_key, target_key in (
+            ("image", "label"),
+            ("images", "labels"),
+            ("input", "target"),
+            ("inputs", "targets"),
+            ("x", "y"),
+        ):
+            if input_key in batch and target_key in batch:
+                return batch[input_key], batch[target_key]
+
+    raise TypeError(
+        "Expected each batch to contain inputs and targets, such as `(images, labels)`."
+    )
+
+
+def _extract_prediction_logits(model_output):
+    """Extract logits from common classifier output structures."""
+    if torch.is_tensor(model_output):
+        return model_output
+
+    if isinstance(model_output, dict) and "logits" in model_output:
+        return model_output["logits"]
+
+    if isinstance(model_output, (list, tuple)) and model_output:
+        first_item = model_output[0]
+        if torch.is_tensor(first_item):
+            return first_item
+
+    raise TypeError("Model output must be a tensor or contain logits in a standard structure.")
+
+
+def _iter_prunable_weight_modules(model):
+    """Yield named Conv/Linear modules whose weights participate in pruning."""
+    for module_name, module in model.named_modules():
+        if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)) and hasattr(module, "weight"):
+            weight = getattr(module, "weight", None)
+            if weight is not None:
+                yield module_name, module
+
+
+def _count_zero_weights(weight_tensor):
+    """Return the number of exact zeros in one weight tensor."""
+    return int((weight_tensor == 0).sum().item())
+
+
+def _clone_linear_from_selected_outputs(linear, keep_indices):
+    """Create a new Linear layer that keeps only selected output neurons."""
+    keep_indices = keep_indices.to(device=linear.weight.device, dtype=torch.long)
+    new_linear = torch.nn.Linear(
+        in_features=linear.in_features,
+        out_features=int(keep_indices.numel()),
+        bias=linear.bias is not None,
+    ).to(device=linear.weight.device, dtype=linear.weight.dtype)
+
+    with torch.no_grad():
+        new_linear.weight.copy_(linear.weight.index_select(0, keep_indices))
+        if linear.bias is not None:
+            new_linear.bias.copy_(linear.bias.index_select(0, keep_indices))
+
+    return new_linear
+
+
+def _clone_linear_from_selected_inputs(linear, keep_indices):
+    """Create a new Linear layer that keeps only selected input neurons."""
+    keep_indices = keep_indices.to(device=linear.weight.device, dtype=torch.long)
+    new_linear = torch.nn.Linear(
+        in_features=int(keep_indices.numel()),
+        out_features=linear.out_features,
+        bias=linear.bias is not None,
+    ).to(device=linear.weight.device, dtype=linear.weight.dtype)
+
+    with torch.no_grad():
+        new_linear.weight.copy_(linear.weight.index_select(1, keep_indices))
+        if linear.bias is not None:
+            new_linear.bias.copy_(linear.bias)
+
+    return new_linear
+
+
+def _resolve_floating_dtype(model):
+    """Infer a floating-point dtype from the model parameters or buffers."""
+    for tensor in model.parameters():
+        if tensor.is_floating_point():
+            return tensor.dtype
+    for tensor in model.buffers():
+        if tensor.is_floating_point():
+            return tensor.dtype
+    return torch.float32
+
+
+def _sparsity_report_impl(model):
+    """Implementation for summarizing model sparsity after optional pruning masks."""
+    model = _require_inference_model(model)
+
+    module_rows = []
+    total_params = 0
+    total_zero_params = 0
+
+    for module_name, module in _iter_prunable_weight_modules(model):
+        weight = module.weight.detach()
+        param_count = int(weight.numel())
+        zero_count = _count_zero_weights(weight)
+        sparsity = zero_count / param_count if param_count > 0 else 0.0
+
+        total_params += param_count
+        total_zero_params += zero_count
+        module_rows.append(
+            {
+                "module": module_name,
+                "type": module.__class__.__name__,
+                "params": param_count,
+                "zero_params": zero_count,
+                "sparsity": sparsity,
+            }
+        )
+
+    if total_params == 0:
+        raise ValueError("No prunable Conv2d/Linear weights were found in the provided model.")
+
+    return {
+        "global_sparsity": total_zero_params / total_params,
+        "total_params": total_params,
+        "zero_params": total_zero_params,
+        "module_sparsity": pd.DataFrame(module_rows),
+    }
+
+
+def _resolve_mobilenetv3_classifier_layers(model):
+    """Return the two Linear layers that form MobileNetV3-Large classifier head."""
+    classifier = getattr(model, "classifier", None)
+    if classifier is None or len(classifier) < 4:
+        raise ValueError("Expected a MobileNetV3-style `classifier` Sequential with 4 layers.")
+
+    first_linear = classifier[0]
+    second_linear = classifier[3]
+    if not isinstance(first_linear, torch.nn.Linear) or not isinstance(second_linear, torch.nn.Linear):
+        raise ValueError(
+            "Expected `model.classifier[0]` and `model.classifier[3]` to be `nn.Linear` layers."
+        )
+
+    return classifier, first_linear, second_linear
+
+
+def _score_classifier_hidden_units(first_linear, second_linear):
+    """Estimate classifier hidden-unit importance using incoming and outgoing L1 norms."""
+    incoming_scores = first_linear.weight.detach().abs().sum(dim=1)
+    outgoing_scores = second_linear.weight.detach().abs().sum(dim=0)
+
+    if first_linear.bias is not None:
+        incoming_scores = incoming_scores + first_linear.bias.detach().abs()
+
+    return incoming_scores + outgoing_scores
+
+
+def _prune_mobilenetv3_classifier_impl(model, hidden_dim):
+    """Implementation for physically shrinking the MobileNetV3-Large classifier width."""
+    model = _require_inference_model(model)
+    pruned_model = copy.deepcopy(model)
+    classifier, first_linear, second_linear = _resolve_mobilenetv3_classifier_layers(pruned_model)
+
+    original_hidden_dim = first_linear.out_features
+    if hidden_dim <= 0:
+        raise ValueError("`hidden_dim` must be a positive integer.")
+    if hidden_dim > original_hidden_dim:
+        raise ValueError(
+            f"`hidden_dim` cannot exceed the original classifier width ({original_hidden_dim})."
+        )
+    if hidden_dim == original_hidden_dim:
+        return pruned_model
+
+    hidden_scores = _score_classifier_hidden_units(first_linear, second_linear)
+    keep_indices = torch.topk(hidden_scores, k=hidden_dim, largest=True).indices
+    keep_indices, _ = torch.sort(keep_indices)
+
+    classifier[0] = _clone_linear_from_selected_outputs(first_linear, keep_indices)
+    classifier[3] = _clone_linear_from_selected_inputs(second_linear, keep_indices)
+    pruned_model.eval()
+    return pruned_model
+
+
+def _bench_impl(
+    model,
+    device,
+    *,
+    batch_size=32,
+    image_size=224,
+    num_warmup=10,
+    num_iterations=50,
+):
+    """Implementation for timing average forward latency on synthetic image batches."""
+    if batch_size <= 0:
+        raise ValueError("`batch_size` must be a positive integer.")
+    if image_size <= 0:
+        raise ValueError("`image_size` must be a positive integer.")
+    if num_warmup < 0:
+        raise ValueError("`num_warmup` cannot be negative.")
+    if num_iterations <= 0:
+        raise ValueError("`num_iterations` must be a positive integer.")
+
+    model = _require_inference_model(model)
+    device = torch.device(device)
+    was_training = getattr(model, "training", False)
+
+    try:
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        model_device = torch.device("cpu")
+
+    if model_device != device:
+        model = model.to(device)
+
+    model.eval()
+
+    input_dtype = _resolve_floating_dtype(model)
+    synthetic_batch = torch.randn(
+        batch_size,
+        3,
+        image_size,
+        image_size,
+        device=device,
+        dtype=input_dtype,
+    )
+
+    try:
+        with torch.inference_mode():
+            for _ in range(num_warmup):
+                _ = model(synthetic_batch)
+
+            _synchronize_device(device)
+            start_time = time.perf_counter()
+
+            for _ in range(num_iterations):
+                _ = model(synthetic_batch)
+
+            _synchronize_device(device)
+            elapsed_seconds = time.perf_counter() - start_time
+    finally:
+        if was_training:
+            model.train()
+
+    return elapsed_seconds / num_iterations
+
+
+def _select_latency_constrained_mobilenetv3_pruning_impl(
+    model,
+    loader,
+    device,
+    *,
+    min_accuracy=0.81,
+    candidate_hidden_dims=(1216, 1152, 1088, 1024),
+    batch_size=32,
+    image_size=224,
+    num_warmup=10,
+    num_iterations=50,
+):
+    """Evaluate classifier-width pruning candidates and keep the best valid one."""
+    model = _require_inference_model(model)
+    device = torch.device(device)
+
+    _, first_linear, _ = _resolve_mobilenetv3_classifier_layers(model)
+    original_hidden_dim = first_linear.out_features
+
+    baseline_model = copy.deepcopy(model).to(device)
+    baseline_model.eval()
+    base_accuracy = compute_accuracy(baseline_model, loader, device)
+    base_time = bench(
+        baseline_model,
+        device,
+        batch_size=batch_size,
+        image_size=image_size,
+        num_warmup=num_warmup,
+        num_iterations=num_iterations,
+    )
+
+    candidate_rows = []
+    selected_model = baseline_model
+    selected_hidden_dim = original_hidden_dim
+    selected_accuracy = base_accuracy
+    selected_time = base_time
+    selected_parameter_reduction = 0.0
+    meets_constraints = False
+
+    seen_hidden_dims = []
+    for hidden_dim in candidate_hidden_dims:
+        hidden_dim = int(hidden_dim)
+        if hidden_dim <= 0 or hidden_dim >= original_hidden_dim or hidden_dim in seen_hidden_dims:
+            continue
+        seen_hidden_dims.append(hidden_dim)
+
+        candidate_model = _prune_mobilenetv3_classifier_impl(model, hidden_dim).to(device)
+        candidate_model.eval()
+        candidate_accuracy = compute_accuracy(candidate_model, loader, device)
+        candidate_time = bench(
+            candidate_model,
+            device,
+            batch_size=batch_size,
+            image_size=image_size,
+            num_warmup=num_warmup,
+            num_iterations=num_iterations,
+        )
+
+        parameter_reduction = 1.0 - (hidden_dim / original_hidden_dim)
+        candidate_is_valid = candidate_accuracy >= min_accuracy and candidate_time < base_time
+        candidate_rows.append(
+            {
+                "hidden_dim": hidden_dim,
+                "parameter_reduction": parameter_reduction,
+                "accuracy": candidate_accuracy,
+                "time_per_batch": candidate_time,
+                "speedup": base_time / candidate_time,
+                "meets_constraints": candidate_is_valid,
+            }
+        )
+
+        if candidate_is_valid and (
+            not meets_constraints
+            or candidate_time < selected_time
+            or (
+                math.isclose(candidate_time, selected_time, rel_tol=1e-9, abs_tol=1e-12)
+                and candidate_accuracy > selected_accuracy
+            )
+        ):
+            selected_model = candidate_model
+            selected_hidden_dim = hidden_dim
+            selected_accuracy = candidate_accuracy
+            selected_time = candidate_time
+            selected_parameter_reduction = parameter_reduction
+            meets_constraints = True
+
+    return {
+        "selected_model": selected_model,
+        "base_accuracy": base_accuracy,
+        "base_time": base_time,
+        "base_hidden_dim": original_hidden_dim,
+        "selected_hidden_dim": selected_hidden_dim,
+        "selected_accuracy": selected_accuracy,
+        "selected_time": selected_time,
+        "selected_parameter_reduction": selected_parameter_reduction,
+        "meets_constraints": meets_constraints,
+        "results": pd.DataFrame(candidate_rows),
+    }
+
+
+def _compute_accuracy_impl(model, loader, device):
+    """Implementation for evaluating one classifier over a labeled DataLoader."""
+    model = _require_inference_model(model)
+    device = torch.device(device)
+
+    if loader is None:
+        raise ValueError("`loader` cannot be None.")
+
+    total_batches = len(loader) if hasattr(loader, "__len__") else None
+    if total_batches == 0:
+        raise ValueError("`loader` must contain at least one batch.")
+
+    was_training = getattr(model, "training", False)
+
+    try:
+        model_device = next(model.parameters()).device
+    except StopIteration:
+        model_device = torch.device("cpu")
+
+    if model_device != device:
+        model = model.to(device)
+
+    model.eval()
+
+    correct_predictions = 0
+    total_examples = 0
+    progress_bar = None
+
+    try:
+        if tqdm is not None:
+            progress_bar = tqdm(loader, desc="Computing Accuracy", total=total_batches)
+            batch_iterator = progress_bar
+        else:
+            batch_iterator = loader
+
+        with torch.inference_mode():
+            for batch in batch_iterator:
+                inputs, targets = _extract_inputs_and_targets(batch)
+                inputs = _move_batch_to_device(inputs, device)
+
+                if torch.is_tensor(targets):
+                    targets = targets.to(device)
+                else:
+                    targets = torch.as_tensor(targets, device=device)
+
+                logits = _extract_prediction_logits(model(inputs))
+                predictions = logits.argmax(dim=1)
+
+                correct_predictions += (predictions == targets).sum().item()
+                total_examples += targets.numel()
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+        if was_training:
+            model.train()
+
+    if total_examples == 0:
+        raise ValueError("No labeled examples were available to compute accuracy.")
+
+    return correct_predictions / total_examples
 
 
 def _measure_loader_efficiency(
