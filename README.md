@@ -164,9 +164,13 @@ Running the code in the notebook in sequence will directly open the MLFlow UI in
 
 ## References 📚
 
-1. Lukas Bossard, Matthieu Guillaumin, and Luc Van Gool. *Food-101 -- Mining Discriminative Components with Random Forests*. ECCV 2014.  
+1. Andrew Howard, Mark Sandler, Grace Chu, Liang-Chieh Chen, Bo Chen, Mingxing Tan, Weijun Wang, Yukun Zhu, Ruoming Pang, Vijay Vasudevan, Quoc V. Le, and Hartwig Adam. *Searching for MobileNetV3*. arXiv 2019.  
+   arXiv: [official paper page](https://arxiv.org/abs/1905.02244)  
+   PDF: [official paper PDF](https://arxiv.org/pdf/1905.02244)
+
+2. Lukas Bossard, Matthieu Guillaumin, and Luc Van Gool. *Food-101 -- Mining Discriminative Components with Random Forests*. ECCV 2014.  
    Project page: [Food-101 dataset page](https://data.vision.ee.ethz.ch/cvl/datasets_extra/food-101/)  
    PDF: [official paper PDF](https://data.vision.ee.ethz.ch/cvl/datasets_extra/food-101/static/bossard_eccv14_food-101.pdf)
 
-2. PyTorch / TorchVision. *`torchvision.datasets.Food101` documentation*.  
+3. PyTorch / TorchVision. *`torchvision.datasets.Food101` documentation*.  
    Docs: [official TorchVision Food101 docs](https://docs.pytorch.org/vision/main/generated/torchvision.datasets.Food101.html)
