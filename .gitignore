@@ -61,8 +61,13 @@ weights/
 # Published release artifacts
 !artifacts/checkpoints/
 !artifacts/weights/
+!artifacts/onnx/
 !artifacts/checkpoints/food101_mobilenetv3_stage2_best.ckpt
 !artifacts/weights/food101_mobilenetv3_stage2_best_state_dict.pth
+!artifacts/onnx/food101_model_FP32.onnx
+!artifacts/onnx/food101_model_FP32.onnx.data
+!artifacts/onnx/food101_model_INT8_matmul_gemm_only.onnx
+
 
 # Dataset directories
 data/

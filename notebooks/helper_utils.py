@@ -7,9 +7,7 @@ The file is organized to match notebook usage order:
 4. Lower-level private implementations and MLflow internals.
 """
 
-import copy
 from collections import Counter
-import io
 import json
 import math
 import os
@@ -39,19 +37,6 @@ except Exception:
     display = None
 
 
-if (
-    hasattr(torch, "mps")
-    and hasattr(torch.mps, "empty_cache")
-    and hasattr(torch, "backends")
-    and hasattr(torch.backends, "mps")
-    and not hasattr(torch.backends.mps, "empty_cache")
-):
-    # The notebook currently calls `torch.backends.mps.empty_cache()`, while
-    # PyTorch exposes the cache helper on `torch.mps.empty_cache()`. Mirror the
-    # public helper here so the notebook cells can keep their current code.
-    torch.backends.mps.empty_cache = torch.mps.empty_cache
-
-
 IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".bmp", ".gif", ".webp")
 # Cache the most recently shown figure so notebook users can call the save helper
 # in a later cell without manually threading `fig` around.
@@ -79,6 +64,8 @@ def _experiment_checkpoint_dir():
 
 def _display_relative_path(path, start=None):
     """Return a stable relative path string for notebook-facing status messages."""
+    # Relative paths keep notebook logs shorter and reproducible across machines
+    # whose absolute workspace roots differ.
     start = Path(start or _notebook_dir())
     return Path(os.path.relpath(path, start=start)).as_posix()
 
@@ -153,6 +140,8 @@ def _contains_tensor(item):
 def _prepare_loader_for_iteration(loader):
     """Validate that the DataLoader yields tensors produced by a transform pipeline."""
     dataset = getattr(loader, "dataset", None)
+    # Empty loaders are allowed here; the downstream timing helpers handle the
+    # "no batches produced" case separately with task-specific errors.
     if dataset is None or len(dataset) == 0:
         return loader
 
@@ -195,6 +184,8 @@ def _synchronize_device(device):
 def _iter_epoch_progress(num_epochs):
     """Yield epoch indices with a tqdm progress bar when tqdm is available."""
     if tqdm is None:
+        # Fall back to a plain generator so the timing helpers still work in
+        # minimal Python environments without notebook-friendly progress bars.
         for epoch_idx in range(1, num_epochs + 1):
             yield epoch_idx, None
         return
@@ -210,6 +201,7 @@ def _iter_epoch_progress(num_epochs):
 def _write_progress_line(progress_bar, message):
     """Print epoch timing lines without corrupting the tqdm bar."""
     if progress_bar is not None:
+        # `progress_bar.write(...)` prints above the bar without overwriting it.
         progress_bar.write(message)
     else:
         print(message)
@@ -356,6 +348,8 @@ def display_random_images(data_dir, num_classes=3, images_per_class=2, random_se
         selected_images = rng.sample(image_map[class_name], images_per_class)
         for col_index, image_path in enumerate(selected_images):
             axis = axes[row_index, col_index]
+            # `plt.imread(...)` is sufficient here because the notebook only
+            # needs a quick qualitative preview, not a training transform.
             axis.imshow(plt.imread(image_path))
             axis.set_title(class_name, fontsize=16)
             axis.axis("off")
@@ -417,6 +411,7 @@ def _remember_figure(fig):
 def _resolve_figure_for_saving(fig=None):
     """Return the explicit figure, the cached figure, or the current active figure."""
     if fig is not None:
+        # Respect an explicit figure first so callers can save non-active plots.
         return fig
 
     global _LAST_RENDERED_FIGURE
@@ -617,6 +612,8 @@ def show_test_prediction_examples(
         sampled_subset,
         batch_size=batch_size,
         shuffle=False,
+        # The subset itself was already shuffled, so keeping the loader ordered
+        # preserves deterministic sampling under the chosen random seed.
         num_workers=num_workers,
     )
 
@@ -625,6 +622,8 @@ def show_test_prediction_examples(
         with torch.inference_mode():
             for image_batch, true_labels in loader:
                 logits = model(image_batch.to(device))
+                # Move predictions back to CPU immediately because the example
+                # records stored below are plain visualization metadata.
                 pred_labels = logits.argmax(dim=1).detach().cpu()
 
                 for image_tensor, true_label, pred_label in zip(
@@ -776,6 +775,8 @@ def show_test_prediction_gradcam_examples(
 
             axis.imshow(example["cam_image"])
             axis.axis("off")
+            # Build the title incrementally so optional CAM-target metadata can
+            # be inserted without duplicating the common Pred/True lines.
             title_lines = []
             # Only add the CAM target line when the heatmap is not already based on
             # the predicted class, which keeps the common case visually compact.
@@ -804,6 +805,8 @@ def _load_food101_class_names_from_metadata():
     if not classes_path.exists():
         return None
 
+    # Strip blank lines so accidental trailing newlines in the metadata file do
+    # not create empty class labels.
     class_names = [line.strip() for line in classes_path.read_text().splitlines() if line.strip()]
     return class_names or None
 
@@ -839,6 +842,8 @@ def show_prediction_grid(
         )
 
     if predictions.ndim == 2:
+        # Treat 2D predictions as classifier logits/probabilities and reduce
+        # them to one label id per image.
         if predictions.shape[0] != num_images:
             raise ValueError(
                 "When `predictions` contains logits, its batch dimension must match `input_data`."
@@ -846,6 +851,8 @@ def show_prediction_grid(
         pred_labels = predictions.argmax(axis=1)
         num_classes = predictions.shape[1]
     elif predictions.ndim == 1:
+        # Treat 1D predictions as precomputed label ids and infer the class
+        # count from the largest label seen in predictions or ground truth.
         if predictions.shape[0] != num_images:
             raise ValueError(
                 "When `predictions` contains label ids, its length must match `input_data`."
@@ -860,6 +867,8 @@ def show_prediction_grid(
     if class_names is None:
         class_names = _load_food101_class_names_from_metadata()
     if class_names is None:
+        # Fall back to generic labels so visualization still works for exported
+        # batches even when Food-101 metadata is unavailable locally.
         class_names = [f"Class {idx}" for idx in range(num_classes)]
     else:
         class_names = list(class_names)
@@ -876,6 +885,7 @@ def show_prediction_grid(
         figsize = (cols * 4.5, rows * 4.5)
 
     fig, axes = plt.subplots(rows, cols, figsize=figsize, squeeze=False)
+    # Flattening keeps the plotting loop simple even when the grid has multiple rows.
     flat_axes = axes.flatten()
 
     for axis, image_array, true_label, pred_label in zip(
@@ -884,6 +894,8 @@ def show_prediction_grid(
         true_labels,
         pred_labels,
     ):
+        # Convert each sample back to a tensor so the same denormalization helper
+        # can be reused for both PyTorch and ONNX notebook outputs.
         image_tensor = torch.as_tensor(image_array).detach().cpu()
         display_image = _denormalize_image(
             image_tensor,
@@ -920,6 +932,8 @@ def save_figure_to_artifacts(
     """Save a Matplotlib figure under `artifacts/<artifact_subdir>/`."""
     project_root = Path(__file__).resolve().parent.parent
     output_dir = project_root / "artifacts" / artifact_subdir
+    # Create the artifact folder lazily so notebook users can call the helper
+    # without preparing directories manually.
     output_dir.mkdir(parents=True, exist_ok=True)
 
     output_path = Path(filename)
@@ -980,6 +994,11 @@ def compute_accuracy(model, loader, device):
     return _compute_accuracy_impl(model, loader, device)
 
 
+def compute_onnx_accuracy(session, loader):
+    """Compute classification accuracy for one ONNX Runtime session over one DataLoader."""
+    return _compute_onnx_accuracy_impl(session, loader)
+
+
 def sparsity_report(model):
     """Summarize weight sparsity across the prunable layers of one model."""
     return _sparsity_report_impl(model)
@@ -998,40 +1017,6 @@ def bench(
     return _bench_impl(
         model,
         device,
-        batch_size=batch_size,
-        image_size=image_size,
-        num_warmup=num_warmup,
-        num_iterations=num_iterations,
-    )
-
-
-def prune_mobilenetv3_classifier(
-    model,
-    hidden_dim,
-):
-    """Physically shrink the MobileNetV3-Large classifier hidden width."""
-    return _prune_mobilenetv3_classifier_impl(model, hidden_dim)
-
-
-def select_latency_constrained_mobilenetv3_pruning(
-    model,
-    loader,
-    device,
-    *,
-    min_accuracy=0.81,
-    candidate_hidden_dims=(1216, 1152, 1088, 1024),
-    batch_size=32,
-    image_size=224,
-    num_warmup=10,
-    num_iterations=50,
-):
-    """Search classifier-width pruning candidates and keep the fastest valid one."""
-    return _select_latency_constrained_mobilenetv3_pruning_impl(
-        model,
-        loader,
-        device,
-        min_accuracy=min_accuracy,
-        candidate_hidden_dims=candidate_hidden_dims,
         batch_size=batch_size,
         image_size=image_size,
         num_warmup=num_warmup,
@@ -1135,36 +1120,51 @@ def visualize_dataloader_efficiency(
     )
 
 
-def get_model_size_mb(model):
-    """Estimate one model's serialized state_dict size in megabytes."""
-    return _get_model_size_mb_impl(model)
+def get_onnx_artifact_size_mb(path):
+    """Return one ONNX artifact size in megabytes, including sidecar weight files."""
+    return _get_onnx_artifact_size_mb_impl(path)
 
 
-def build_quantization_comparison_df(
-    fp32_model,
-    quantized_model,
+def bench_onnx_session(
+    session,
     *,
-    fp32_acc,
-    quant_acc,
-    fp32_time_s,
-    quant_time_s,
-    quantized_label="Quantized Model (Dynamic)",
+    batch_size=32,
+    image_size=224,
+    num_warmup=10,
+    num_iterations=50,
 ):
-    """Build a comparison table for baseline vs. quantized model size, latency, and accuracy."""
-    return _build_quantization_comparison_df_impl(
-        fp32_model,
-        quantized_model,
-        fp32_acc=fp32_acc,
-        quant_acc=quant_acc,
-        fp32_time_s=fp32_time_s,
-        quant_time_s=quant_time_s,
-        quantized_label=quantized_label,
+    """Benchmark average forward time per synthetic ONNX Runtime image batch."""
+    return _bench_onnx_session_impl(
+        session,
+        batch_size=batch_size,
+        image_size=image_size,
+        num_warmup=num_warmup,
+        num_iterations=num_iterations,
     )
 
 
-def build_model_comparison_df(model_specs):
-    """Build a comparison table for an arbitrary list of evaluated models."""
-    return _build_model_comparison_df_impl(model_specs)
+def build_onnx_quantization_comparison_df(
+    fp32_onnx_path,
+    quantized_onnx_path,
+    *,
+    fp32_time_s,
+    quantized_time_s,
+    fp32_acc=None,
+    quantized_acc=None,
+    fp32_label="Baseline ONNX",
+    quantized_label="Quantized ONNX (Static)",
+):
+    """Build a comparison table for baseline vs. quantized ONNX artifact size, latency, and accuracy."""
+    return _build_onnx_quantization_comparison_df_impl(
+        fp32_onnx_path,
+        quantized_onnx_path,
+        fp32_time_s=fp32_time_s,
+        quantized_time_s=quantized_time_s,
+        fp32_acc=fp32_acc,
+        quantized_acc=quantized_acc,
+        fp32_label=fp32_label,
+        quantized_label=quantized_label,
+    )
 
 
 def _plot_performance_summary_impl(
@@ -1189,6 +1189,8 @@ def _plot_performance_summary_impl(
     ordered_items = [
         (_restore_case_key(case), value) for case, value in performance_by_case.items()
     ]
+    # Build x/y arrays manually so invalid cached values can be skipped while
+    # still preserving the original case ordering in the notebook plot.
 
     x_labels = []
     y_values = []
@@ -1227,6 +1229,7 @@ def _plot_performance_summary_impl(
 
     y_min = min(y_values)
     y_max = max(y_values)
+    # Keep a small top margin above the highest point so annotations do not clip.
     y_span = max(y_max - y_min, y_max * 0.08, 1.0)
     annotation_offset = y_span * 0.06
     ax.set_ylim(bottom=0, top=y_max + annotation_offset * 2.0)
@@ -1255,96 +1258,188 @@ def _plot_performance_summary_impl(
     return fig, ax
 
 
-def _get_model_size_mb_impl(model):
-    """Implementation for estimating serialized state_dict size in megabytes."""
-    model = _require_inference_model(model)
-    buffer = io.BytesIO()
-    try:
-        torch.save(model.state_dict(), buffer)
-        return buffer.getbuffer().nbytes / (1024 ** 2)
-    finally:
-        buffer.close()
+def _get_onnx_artifact_size_mb_impl(path):
+    """Implementation for returning one ONNX artifact size including sidecar weight files."""
+    path = Path(path).expanduser().resolve()
+    if not path.is_file():
+        raise FileNotFoundError(f"Artifact file does not exist: {path}")
+
+    artifact_paths = {path}
+    # ONNX external-data exports may split tensor weights into sidecar files, so
+    # include them to reflect the actual deployable artifact size.
+    artifact_paths.update(
+        sidecar_path
+        for sidecar_path in path.parent.glob(f"{path.name}.data*")
+        if sidecar_path.is_file()
+    )
+
+    total_size_bytes = sum(artifact_path.stat().st_size for artifact_path in artifact_paths)
+    return total_size_bytes / (1024 ** 2)
 
 
-def _build_quantization_comparison_df_impl(
-    fp32_model,
-    quantized_model,
+def _bench_onnx_session_impl(
+    session,
     *,
-    fp32_acc,
-    quant_acc,
-    fp32_time_s,
-    quant_time_s,
-    quantized_label="Quantized Model (Dynamic)",
+    batch_size=32,
+    image_size=224,
+    num_warmup=10,
+    num_iterations=50,
 ):
-    """Implementation for comparing baseline and quantized models in one DataFrame."""
-    fp32_size_mb = _get_model_size_mb_impl(fp32_model)
-    quant_size_mb = _get_model_size_mb_impl(quantized_model)
+    """Implementation for timing average ONNX Runtime latency on synthetic image batches."""
+    if batch_size <= 0:
+        raise ValueError("`batch_size` must be a positive integer.")
+    if image_size <= 0:
+        raise ValueError("`image_size` must be a positive integer.")
+    if num_warmup < 0:
+        raise ValueError("`num_warmup` cannot be negative.")
+    if num_iterations <= 0:
+        raise ValueError("`num_iterations` must be a positive integer.")
+
+    if session is None:
+        raise ValueError("`session` cannot be None.")
+
+    input_metadata = session.get_inputs()
+    if not input_metadata:
+        raise ValueError("The ONNX Runtime session does not expose any inputs.")
+
+    input_name = input_metadata[0].name
+    rng = np.random.default_rng(0)
+    # Use a fixed synthetic batch so repeated latency measurements stay comparable
+    # across candidate ONNX exports inside the notebook.
+    synthetic_batch = np.ascontiguousarray(
+        rng.standard_normal((batch_size, 3, image_size, image_size), dtype=np.float32)
+    )
+
+    for _ in range(num_warmup):
+        # Warm-up runs let ORT finish one-time graph/runtime setup before timing.
+        _ = session.run(None, {input_name: synthetic_batch})
+
+    start_time = time.perf_counter()
+    for _ in range(num_iterations):
+        _ = session.run(None, {input_name: synthetic_batch})
+    elapsed_seconds = time.perf_counter() - start_time
+
+    return elapsed_seconds / num_iterations
+
+
+def _compute_onnx_accuracy_impl(session, loader):
+    """Implementation for evaluating one ONNX Runtime classifier over a labeled DataLoader."""
+    if session is None:
+        raise ValueError("`session` cannot be None.")
+    if loader is None:
+        raise ValueError("`loader` cannot be None.")
+
+    total_batches = len(loader) if hasattr(loader, "__len__") else None
+    if total_batches == 0:
+        raise ValueError("`loader` must contain at least one batch.")
+
+    input_metadata = session.get_inputs()
+    if not input_metadata:
+        raise ValueError("The ONNX Runtime session does not expose any inputs.")
+
+    input_name = input_metadata[0].name
+    correct_predictions = 0
+    total_examples = 0
+    progress_bar = None
+
+    try:
+        if tqdm is not None:
+            progress_bar = tqdm(loader, desc="Computing ONNX Accuracy", total=total_batches)
+            batch_iterator = progress_bar
+        else:
+            batch_iterator = loader
+
+        for batch in batch_iterator:
+            inputs, targets = _extract_inputs_and_targets(batch)
+
+            if not torch.is_tensor(inputs):
+                # Accept list/NumPy batches too, then normalize them to tensors
+                # before converting to contiguous NumPy arrays for ORT.
+                inputs = torch.as_tensor(inputs)
+            if not torch.is_tensor(targets):
+                targets = torch.as_tensor(targets)
+
+            ort_inputs = {
+                input_name: np.ascontiguousarray(
+                    # ORT inference in this notebook expects FP32 image tensors.
+                    inputs.detach().cpu().numpy().astype(np.float32)
+                )
+            }
+            logits = session.run(None, ort_inputs)[0]
+            predictions = np.asarray(logits).argmax(axis=1)
+            targets_np = targets.detach().cpu().numpy()
+
+            correct_predictions += int((predictions == targets_np).sum())
+            total_examples += int(targets_np.size)
+    finally:
+        if progress_bar is not None:
+            progress_bar.close()
+
+    if total_examples == 0:
+        raise ValueError("`loader` did not yield any labeled examples.")
+
+    return correct_predictions / total_examples
+
+
+def _build_onnx_quantization_comparison_df_impl(
+    fp32_onnx_path,
+    quantized_onnx_path,
+    *,
+    fp32_time_s,
+    quantized_time_s,
+    fp32_acc=None,
+    quantized_acc=None,
+    fp32_label="Baseline ONNX",
+    quantized_label="Quantized ONNX (Static)",
+):
+    """Implementation for comparing ONNX artifact size, latency, and optional accuracy."""
+    fp32_size_mb = _get_onnx_artifact_size_mb_impl(fp32_onnx_path)
+    quantized_size_mb = _get_onnx_artifact_size_mb_impl(quantized_onnx_path)
+
+    baseline_values = [
+        fp32_size_mb,
+        fp32_time_s * 1e3,
+    ]
+    quantized_values = [
+        quantized_size_mb,
+        quantized_time_s * 1e3,
+    ]
+    change_values = [
+        fp32_size_mb - quantized_size_mb,
+        (fp32_time_s - quantized_time_s) * 1e3,
+    ]
+    row_index = [
+        "Model Size (MB)",
+        "Inference Latency (ms)",
+    ]
+
+    if fp32_acc is not None and quantized_acc is not None:
+        # Accuracy is optional because some notebook cells compare artifacts
+        # before the final end-to-end evaluation has finished running.
+        baseline_values.append(fp32_acc * 100)
+        quantized_values.append(quantized_acc * 100)
+        change_values.append((quantized_acc - fp32_acc) * 100)
+        row_index.append("Accuracy (%)")
 
     return pd.DataFrame(
         {
-            "Baseline Model": [
-                fp32_size_mb,
-                fp32_time_s * 1e3,
-                fp32_acc * 100,
-            ],
-            quantized_label: [
-                quant_size_mb,
-                quant_time_s * 1e3,
-                quant_acc * 100,
-            ],
-            "Change": [
-                fp32_size_mb - quant_size_mb,
-                (fp32_time_s - quant_time_s) * 1e3,
-                (quant_acc - fp32_acc) * 100,
-            ],
+            fp32_label: baseline_values,
+            quantized_label: quantized_values,
+            "Change": change_values,
         },
-        index=[
-            "Model Size (MB)",
-            "Inference Latency (ms)",
-            "Accuracy (pp)",
-        ],
-    )
-
-
-def _build_model_comparison_df_impl(model_specs):
-    """Implementation for building a multi-model comparison DataFrame."""
-    if not model_specs:
-        raise ValueError("`model_specs` cannot be empty.")
-
-    column_data = {}
-    for spec in model_specs:
-        label = spec.get("label")
-        model = spec.get("model")
-        accuracy = spec.get("accuracy")
-        latency_s = spec.get("latency_s")
-
-        if label is None or model is None or accuracy is None or latency_s is None:
-            raise ValueError(
-                "Each model spec must provide `label`, `model`, `accuracy`, and `latency_s`."
-            )
-
-        column_data[str(label)] = [
-            _get_model_size_mb_impl(model),
-            float(latency_s) * 1e3,
-            float(accuracy) * 100,
-        ]
-
-    return pd.DataFrame(
-        column_data,
-        index=[
-            "Model Size (MB)",
-            "Inference Latency (ms)",
-            "Accuracy (%)",
-        ],
+        index=row_index,
     )
 
 
 def _extract_inputs_and_targets(batch):
     """Normalize common batch structures into an `(inputs, targets)` pair."""
     if isinstance(batch, (list, tuple)) and len(batch) >= 2:
+        # Covers the usual `(images, labels)` dataset / DataLoader convention.
         return batch[0], batch[1]
 
     if isinstance(batch, dict):
+        # Support a handful of common naming conventions so helper functions can
+        # work with custom datasets without per-notebook adapter code.
         for input_key, target_key in (
             ("image", "label"),
             ("images", "labels"),
@@ -1366,6 +1461,7 @@ def _extract_prediction_logits(model_output):
         return model_output
 
     if isinstance(model_output, dict) and "logits" in model_output:
+        # Hugging Face style outputs often expose logits under a named key.
         return model_output["logits"]
 
     if isinstance(model_output, (list, tuple)) and model_output:
@@ -1382,6 +1478,7 @@ def _iter_prunable_weight_modules(model):
         if isinstance(module, (torch.nn.Conv2d, torch.nn.Linear)) and hasattr(module, "weight"):
             weight = getattr(module, "weight", None)
             if weight is not None:
+                # Yield both the name and module so callers can build readable reports.
                 yield module_name, module
 
 
@@ -1390,44 +1487,12 @@ def _count_zero_weights(weight_tensor):
     return int((weight_tensor == 0).sum().item())
 
 
-def _clone_linear_from_selected_outputs(linear, keep_indices):
-    """Create a new Linear layer that keeps only selected output neurons."""
-    keep_indices = keep_indices.to(device=linear.weight.device, dtype=torch.long)
-    new_linear = torch.nn.Linear(
-        in_features=linear.in_features,
-        out_features=int(keep_indices.numel()),
-        bias=linear.bias is not None,
-    ).to(device=linear.weight.device, dtype=linear.weight.dtype)
-
-    with torch.no_grad():
-        new_linear.weight.copy_(linear.weight.index_select(0, keep_indices))
-        if linear.bias is not None:
-            new_linear.bias.copy_(linear.bias.index_select(0, keep_indices))
-
-    return new_linear
-
-
-def _clone_linear_from_selected_inputs(linear, keep_indices):
-    """Create a new Linear layer that keeps only selected input neurons."""
-    keep_indices = keep_indices.to(device=linear.weight.device, dtype=torch.long)
-    new_linear = torch.nn.Linear(
-        in_features=int(keep_indices.numel()),
-        out_features=linear.out_features,
-        bias=linear.bias is not None,
-    ).to(device=linear.weight.device, dtype=linear.weight.dtype)
-
-    with torch.no_grad():
-        new_linear.weight.copy_(linear.weight.index_select(1, keep_indices))
-        if linear.bias is not None:
-            new_linear.bias.copy_(linear.bias)
-
-    return new_linear
-
-
 def _resolve_floating_dtype(model):
     """Infer a floating-point dtype from the model parameters or buffers."""
     for tensor in model.parameters():
         if tensor.is_floating_point():
+            # Match the synthetic benchmark batch dtype to the model weights to
+            # avoid accidental dtype promotion during timing.
             return tensor.dtype
     for tensor in model.buffers():
         if tensor.is_floating_point():
@@ -1444,6 +1509,8 @@ def _sparsity_report_impl(model):
     total_zero_params = 0
 
     for module_name, module in _iter_prunable_weight_modules(model):
+        # Read the realized weight tensor directly so pruning masks that have
+        # already been materialized into zeros are reflected in the report.
         weight = module.weight.detach()
         param_count = int(weight.numel())
         zero_count = _count_zero_weights(weight)
@@ -1465,64 +1532,13 @@ def _sparsity_report_impl(model):
         raise ValueError("No prunable Conv2d/Linear weights were found in the provided model.")
 
     return {
+        # Return both a compact global metric and a per-layer table so notebook
+        # cells can print one summary line or inspect detailed sparsity later.
         "global_sparsity": total_zero_params / total_params,
         "total_params": total_params,
         "zero_params": total_zero_params,
         "module_sparsity": pd.DataFrame(module_rows),
     }
-
-
-def _resolve_mobilenetv3_classifier_layers(model):
-    """Return the two Linear layers that form MobileNetV3-Large classifier head."""
-    classifier = getattr(model, "classifier", None)
-    if classifier is None or len(classifier) < 4:
-        raise ValueError("Expected a MobileNetV3-style `classifier` Sequential with 4 layers.")
-
-    first_linear = classifier[0]
-    second_linear = classifier[3]
-    if not isinstance(first_linear, torch.nn.Linear) or not isinstance(second_linear, torch.nn.Linear):
-        raise ValueError(
-            "Expected `model.classifier[0]` and `model.classifier[3]` to be `nn.Linear` layers."
-        )
-
-    return classifier, first_linear, second_linear
-
-
-def _score_classifier_hidden_units(first_linear, second_linear):
-    """Estimate classifier hidden-unit importance using incoming and outgoing L1 norms."""
-    incoming_scores = first_linear.weight.detach().abs().sum(dim=1)
-    outgoing_scores = second_linear.weight.detach().abs().sum(dim=0)
-
-    if first_linear.bias is not None:
-        incoming_scores = incoming_scores + first_linear.bias.detach().abs()
-
-    return incoming_scores + outgoing_scores
-
-
-def _prune_mobilenetv3_classifier_impl(model, hidden_dim):
-    """Implementation for physically shrinking the MobileNetV3-Large classifier width."""
-    model = _require_inference_model(model)
-    pruned_model = copy.deepcopy(model)
-    classifier, first_linear, second_linear = _resolve_mobilenetv3_classifier_layers(pruned_model)
-
-    original_hidden_dim = first_linear.out_features
-    if hidden_dim <= 0:
-        raise ValueError("`hidden_dim` must be a positive integer.")
-    if hidden_dim > original_hidden_dim:
-        raise ValueError(
-            f"`hidden_dim` cannot exceed the original classifier width ({original_hidden_dim})."
-        )
-    if hidden_dim == original_hidden_dim:
-        return pruned_model
-
-    hidden_scores = _score_classifier_hidden_units(first_linear, second_linear)
-    keep_indices = torch.topk(hidden_scores, k=hidden_dim, largest=True).indices
-    keep_indices, _ = torch.sort(keep_indices)
-
-    classifier[0] = _clone_linear_from_selected_outputs(first_linear, keep_indices)
-    classifier[3] = _clone_linear_from_selected_inputs(second_linear, keep_indices)
-    pruned_model.eval()
-    return pruned_model
 
 
 def _bench_impl(
@@ -1554,11 +1570,14 @@ def _bench_impl(
         model_device = torch.device("cpu")
 
     if model_device != device:
+        # Time execution on the caller-requested device even if the supplied
+        # model checkpoint currently lives elsewhere.
         model = model.to(device)
 
     model.eval()
 
     input_dtype = _resolve_floating_dtype(model)
+    # Use synthetic data so latency comparisons are not confounded by I/O.
     synthetic_batch = torch.randn(
         batch_size,
         3,
@@ -1571,6 +1590,7 @@ def _bench_impl(
     try:
         with torch.inference_mode():
             for _ in range(num_warmup):
+                # Warm-up runs absorb one-time kernel selection / compilation cost.
                 _ = model(synthetic_batch)
 
             _synchronize_device(device)
@@ -1586,106 +1606,6 @@ def _bench_impl(
             model.train()
 
     return elapsed_seconds / num_iterations
-
-
-def _select_latency_constrained_mobilenetv3_pruning_impl(
-    model,
-    loader,
-    device,
-    *,
-    min_accuracy=0.81,
-    candidate_hidden_dims=(1216, 1152, 1088, 1024),
-    batch_size=32,
-    image_size=224,
-    num_warmup=10,
-    num_iterations=50,
-):
-    """Evaluate classifier-width pruning candidates and keep the best valid one."""
-    model = _require_inference_model(model)
-    device = torch.device(device)
-
-    _, first_linear, _ = _resolve_mobilenetv3_classifier_layers(model)
-    original_hidden_dim = first_linear.out_features
-
-    baseline_model = copy.deepcopy(model).to(device)
-    baseline_model.eval()
-    base_accuracy = compute_accuracy(baseline_model, loader, device)
-    base_time = bench(
-        baseline_model,
-        device,
-        batch_size=batch_size,
-        image_size=image_size,
-        num_warmup=num_warmup,
-        num_iterations=num_iterations,
-    )
-
-    candidate_rows = []
-    selected_model = baseline_model
-    selected_hidden_dim = original_hidden_dim
-    selected_accuracy = base_accuracy
-    selected_time = base_time
-    selected_parameter_reduction = 0.0
-    meets_constraints = False
-
-    seen_hidden_dims = []
-    for hidden_dim in candidate_hidden_dims:
-        hidden_dim = int(hidden_dim)
-        if hidden_dim <= 0 or hidden_dim >= original_hidden_dim or hidden_dim in seen_hidden_dims:
-            continue
-        seen_hidden_dims.append(hidden_dim)
-
-        candidate_model = _prune_mobilenetv3_classifier_impl(model, hidden_dim).to(device)
-        candidate_model.eval()
-        candidate_accuracy = compute_accuracy(candidate_model, loader, device)
-        candidate_time = bench(
-            candidate_model,
-            device,
-            batch_size=batch_size,
-            image_size=image_size,
-            num_warmup=num_warmup,
-            num_iterations=num_iterations,
-        )
-
-        parameter_reduction = 1.0 - (hidden_dim / original_hidden_dim)
-        candidate_is_valid = candidate_accuracy >= min_accuracy and candidate_time < base_time
-        candidate_rows.append(
-            {
-                "hidden_dim": hidden_dim,
-                "parameter_reduction": parameter_reduction,
-                "accuracy": candidate_accuracy,
-                "time_per_batch": candidate_time,
-                "speedup": base_time / candidate_time,
-                "meets_constraints": candidate_is_valid,
-            }
-        )
-
-        if candidate_is_valid and (
-            not meets_constraints
-            or candidate_time < selected_time
-            or (
-                math.isclose(candidate_time, selected_time, rel_tol=1e-9, abs_tol=1e-12)
-                and candidate_accuracy > selected_accuracy
-            )
-        ):
-            selected_model = candidate_model
-            selected_hidden_dim = hidden_dim
-            selected_accuracy = candidate_accuracy
-            selected_time = candidate_time
-            selected_parameter_reduction = parameter_reduction
-            meets_constraints = True
-
-    return {
-        "selected_model": selected_model,
-        "base_accuracy": base_accuracy,
-        "base_time": base_time,
-        "base_hidden_dim": original_hidden_dim,
-        "selected_hidden_dim": selected_hidden_dim,
-        "selected_accuracy": selected_accuracy,
-        "selected_time": selected_time,
-        "selected_parameter_reduction": selected_parameter_reduction,
-        "meets_constraints": meets_constraints,
-        "results": pd.DataFrame(candidate_rows),
-    }
 
 
 def _compute_accuracy_impl(model, loader, device):
@@ -1729,6 +1649,8 @@ def _compute_accuracy_impl(model, loader, device):
                 inputs = _move_batch_to_device(inputs, device)
 
                 if torch.is_tensor(targets):
+                    # Keep targets on the same device as predictions so equality
+                    # checks do not trigger implicit copies.
                     targets = targets.to(device)
                 else:
                     targets = torch.as_tensor(targets, device=device)
@@ -1837,6 +1759,8 @@ def _visualize_dataloader_efficiency_impl(
 
     summary_rows = []
     for loader_name, loader in loaders_to_compare.items():
+        # Measure each candidate independently so the returned summary table can
+        # also be reused outside the plotted figure.
         metrics = _measure_loader_efficiency(
             loader,
             device,
@@ -1884,6 +1808,8 @@ def _visualize_dataloader_efficiency_impl(
     ax.legend(frameon=False)
 
     for bar, active_pct in zip(active_bars, summary_df["active_pct"]):
+        # Label the active portion directly because that is the quantity users
+        # typically compare when choosing a DataLoader configuration.
         ax.annotate(
             f"{active_pct:.1f}%",
             xy=(bar.get_x() + bar.get_width() / 2.0, active_pct),
@@ -1956,6 +1882,8 @@ def _run_experiment_impl(
 ):
     """Implementation for running, caching, and restoring notebook experiment results."""
     checkpoint_dir = Path(checkpoint_dir or _experiment_checkpoint_dir())
+    # Keep all notebook experiment caches in one shared directory so reruns can
+    # reuse previous timing sweeps across sessions.
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = checkpoint_dir / f"{experiment_name}.json"
     relative_checkpoint_path = _display_relative_path(checkpoint_path)
@@ -1980,6 +1908,7 @@ def _run_experiment_impl(
 
     print(f"Executing experiment '{experiment_name}'...")
     experiment_results = experiment_fcn(cases, **experiment_kwargs)
+    # The experiment function is expected to return a mapping keyed by `cases`.
 
     # Stringify keys on write because JSON object keys must be strings, while
     # notebook experiments often use ints / floats / NumPy scalars as cases.
@@ -2031,6 +1960,8 @@ def _default_mlflow_tracking_uri():
     # `artifacts/mlruns/` layout used by the project notebooks.
     for candidate in (project_root / "mlruns", project_root / "artifacts" / "mlruns"):
         if candidate.exists():
+            # Return the first existing store so older and newer notebook layouts
+            # both keep working without manual path changes.
             return candidate.as_uri()
     return (project_root / "mlruns").as_uri()
 
@@ -2206,6 +2137,8 @@ def _compare_stage_training_runs_impl(
     fig = None
     axes = None
     if plot:
+        # Build the optional figure only when requested because some notebook
+        # cells only need the summary table for reporting.
         max_epoch = int(max(stage1_history[epoch_col].max(), stage2_history[epoch_col].max()))
         # Use a shared integer tick grid so both training stages line up visually.
         xticks = list(range(1, max_epoch + 1))
@@ -2430,6 +2363,7 @@ def _start_mlflow_ui_impl(tracking_dir=None, host="127.0.0.1", port=5000, timeou
 
     if _is_port_open(host, port):
         url = f"http://{host}:{port}"
+        # Reuse an existing server instead of spawning a duplicate process on the same port.
         print("MLflow UI appears to already be running.")
         if display is not None and HTML is not None:
             display(HTML(f'Access from: <a href="{url}" target="_blank">Open MLflow UI</a>'))
@@ -2464,6 +2398,7 @@ def _start_mlflow_ui_impl(tracking_dir=None, host="127.0.0.1", port=5000, timeou
     deadline = time.time() + timeout
     while time.time() < deadline:
         if mlflow_process.poll() is not None:
+            # If the child exits before the port opens, treat that as a startup failure.
             raise RuntimeError("MLflow UI failed to start. Check that `mlflow` is installed correctly.")
         if _is_port_open(host, port):
             break
