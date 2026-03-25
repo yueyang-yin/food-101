@@ -24,15 +24,17 @@ The Stage 2 model was selected as the final training result because it clearly o
 
 **Baseline training curves**
 
-![Baseline train loss](../artifacts/figures/mobilenet_baseline_train_loss.png)
-
-![Baseline validation accuracy](../artifacts/figures/mobilenet_baseline_val_acc.png)
+<p align="center">
+  <img src="../artifacts/figures/mobilenet_baseline_train_loss.png" alt="Baseline train loss" width="48%">
+  <img src="../artifacts/figures/mobilenet_baseline_val_acc.png" alt="Baseline validation accuracy" width="48%">
+</p>
 
 **Final Stage 2 training curves**
 
-![Stage 2 train loss](../artifacts/figures/mobilenet_stage2_train_loss.png)
-
-![Stage 2 validation accuracy](../artifacts/figures/mobilenet_stage2_val_acc.png)
+<p align="center">
+  <img src="../artifacts/figures/mobilenet_stage2_train_loss.png" alt="Stage 2 train loss" width="48%">
+  <img src="../artifacts/figures/mobilenet_stage2_val_acc.png" alt="Stage 2 validation accuracy" width="48%">
+</p>
 
 ### 2.2 Efficiency Analysis
 
@@ -47,21 +49,24 @@ To improve training throughput on the local environment, several `DataLoader` se
 
 These results show that efficiency tuning is strongly hardware-dependent. In this project, more aggressive settings did not automatically improve throughput, so the final pipeline kept the simpler and more stable configuration.
 
-![Num workers benchmark](../artifacts/figures/num_workers_output.png)
+<p align="center">
+  <img src="../artifacts/figures/num_workers_output.png" alt="Num workers benchmark" width="32%">
+  <img src="../artifacts/figures/num_workers_GPU_output.png" alt="Num workers GPU benchmark" width="32%">
+  <img src="../artifacts/figures/batch_size_output.png" alt="Batch size benchmark" width="32%">
+</p>
 
-![Num workers GPU benchmark](../artifacts/figures/num_workers_GPU_output.png)
-
-![Batch size benchmark](../artifacts/figures/batch_size_output.png)
-
-![Pin memory benchmark](../artifacts/figures/pin_memory_output.png)
-
-![Prefetch factor benchmark](../artifacts/figures/prefetch_factor_output.png)
+<p align="center">
+  <img src="../artifacts/figures/pin_memory_output.png" alt="Pin memory benchmark" width="48%">
+  <img src="../artifacts/figures/prefetch_factor_output.png" alt="Prefetch factor benchmark" width="48%">
+</p>
 
 ### 2.3 Error Analysis with Grad-CAM
 
 After training, the best Stage 2 checkpoint was inspected qualitatively using `Grad-CAM`. Correct and incorrect predictions from the test set were visualized to understand whether the model focused on the food item itself or on distracting context such as plates, background textures, or visually similar ingredients. The heatmaps indicate that the model usually attends to the main dish region on correct predictions, while several mistakes are associated with ambiguous presentation and class similarity.
 
-![Grad-CAM analysis](../artifacts/figures/Grad_CAM_output.png)
+<p align="center">
+  <img src="../artifacts/figures/Grad_CAM_output.png" alt="Grad-CAM analysis" width="72%">
+</p>
 
 ### 2.4 Deployment Optimization
 
@@ -91,13 +96,17 @@ This quantized artifact reduced model size by about `23%` with only a negligible
 
 The final selected Stage 2 model achieved about `82.76%` accuracy on the held-out test set. This is the main headline result of the project and confirms that the two-stage fine-tuning strategy generalized well beyond the validation split.
 
-![Stage 2 test accuracy curve](../artifacts/figures/mobilenet_stage2_test_acc.png)
+<p align="center">
+  <img src="../artifacts/figures/mobilenet_stage2_test_acc.png" alt="Stage 2 test accuracy curve" width="62%">
+</p>
 
 ### 3.2 Qualitative Predictions
 
 Qualitative validation predictions show that the final model is able to correctly classify many visually diverse dishes with strong confidence. These examples complement the quantitative test metrics by showing that the model remains robust across different dish appearances, backgrounds, and presentation styles.
 
-![Stage 2 validation predictions](../artifacts/figures/mobilenet_stage2_val_predictions.png)
+<p align="center">
+  <img src="../artifacts/figures/mobilenet_stage2_val_predictions.png" alt="Stage 2 validation predictions" width="72%">
+</p>
 
 （The answer was quite unexpected and made me laugh for a long time, but seriously, I still agree with dataset's label: Thomas looks more like a hot dog 🌭）
 
@@ -111,7 +120,9 @@ From an engineering perspective, the project also shows that deployment optimiza
 
 The final ONNX artifact was also tested through an end-to-end inference demo. This step confirms that the exported deployment model can load correctly and produce readable predictions on real images, rather than only performing well in metric tables.
 
-![ONNX inference demo](../artifacts/figures/ONNX_inference.png)
+<p align="center">
+  <img src="../artifacts/figures/ONNX_inference.png" alt="ONNX inference demo" width="72%">
+</p>
 
 ## 5. Conclusion
 
