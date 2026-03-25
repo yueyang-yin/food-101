@@ -59,6 +59,8 @@ weights/
 *.npz
 
 # Published release artifacts
+!artifacts/figures/
+!artifacts/figures/*
 !artifacts/checkpoints/
 !artifacts/weights/
 !artifacts/onnx/
