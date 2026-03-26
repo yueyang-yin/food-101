@@ -1,4 +1,4 @@
-# Food-101 🍜
+# Food-101
 
 Food-101 classification project built around `MobileNetV3-Large`, with a full workflow that goes from dataset sanity checks to training, analysis, and deployment-oriented export.
 
@@ -7,7 +7,7 @@ This repo focuses on two things:
 - getting a compact model to perform well on `Food-101`
 - treating efficiency and deployment as part of the project, not as an afterthought
 
-## Overview 🔍
+## Overview
 
 The project includes:
 
@@ -19,7 +19,7 @@ The project includes:
 - pruning experiments
 - ONNX export and selective static INT8 quantization with `onnxruntime`
 
-## Results 📊
+## Results
 
 | Item | Result |
 | --- | --- |
@@ -31,7 +31,7 @@ The project includes:
 | Quantized accuracy change | `82.764% -> 82.745%` |
 | Pruning | Not kept in the final path |
 
-## Project Structure 🗂️
+## Project Structure
 
 ```text
 food101-efficient-cv/
@@ -64,7 +64,7 @@ food101-efficient-cv/
     └── final_report.md                 # final project report
 ```
 
-## Setup ⚙️
+## Setup
 
 ### 1. Clone the repository
 
@@ -84,7 +84,7 @@ conda activate food101
 
 `requirements.txt` is kept mainly as an environment snapshot. For a clean reproduction on another machine, `environment.yml` is the safer option.
 
-## Reproduction 🧪
+## Reproduction
 
 Launch Jupyter from the project root:
 
@@ -134,7 +134,7 @@ Main outputs:
 
 - ONNX artifacts in `artifacts/onnx/`
 
-## Notes 📝
+## Notes
 
 - The repo structure above reflects the files intended to be kept in Git.
 - `data/food-101/` is generated locally after download and is ignored by `.gitignore`.
@@ -144,7 +144,7 @@ Main outputs:
 - Notebook paths are written relative to the `notebooks/` directory, so the safest workflow is to launch Jupyter from the repo root.
 - `DataLoader` benchmark results are machine-dependent.
 
-## Useful Artifacts 📦
+## Useful Artifacts
 
 - Final report: [reports/final_report.md](reports/final_report.md)
 - Best checkpoint: [artifacts/checkpoints/food101_mobilenetv3_stage2_best.ckpt](artifacts/checkpoints/food101_mobilenetv3_stage2_best.ckpt)
@@ -152,7 +152,7 @@ Main outputs:
 - FP32 ONNX model: [artifacts/onnx/food101_model_FP32.onnx](artifacts/onnx/food101_model_FP32.onnx)
 - Selected INT8 ONNX model: [artifacts/onnx/food101_model_INT8_matmul_gemm_only.onnx](artifacts/onnx/food101_model_INT8_matmul_gemm_only.onnx)
 
-## MLflow 📈
+## MLflow
 
 To inspect experiment runs locally:
 
@@ -160,9 +160,9 @@ To inspect experiment runs locally:
 mlflow ui --backend-store-uri ./mlruns
 ```
 
-Running the code in the notebook in sequence will directly open the MLFlow UI in the Jupyter environment through helper function.
+Running the notebooks in sequence will open the MLflow UI in Jupyter through a helper function.
 
-## References 📚
+## References
 
 1. Andrew Howard, Mark Sandler, Grace Chu, Liang-Chieh Chen, Bo Chen, Mingxing Tan, Weijun Wang, Yukun Zhu, Ruoming Pang, Vijay Vasudevan, Quoc V. Le, and Hartwig Adam. *Searching for MobileNetV3*. arXiv 2019.  
    arXiv: [official paper page](https://arxiv.org/abs/1905.02244)  
